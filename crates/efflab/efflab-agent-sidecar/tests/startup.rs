@@ -4,6 +4,7 @@
 //! 隔离；fixture 全部在临时目录中生成，不读取或修改仓库内配置。
 
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ const SIDECAR_BIN: &str = env!("CARGO_BIN_EXE_efflab-agent-sidecar");
 const HOME_LOCK_FILENAME: &str = ".efflab-sidecar.lock";
 const RUNTIME_CONFIG_FILENAME: &str = "runtime-config.v1.toml";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 
 #[test]
 fn manifest_declares_minimal_runtime_dependencies_directly() {
@@ -159,16 +162,42 @@ struct Fixture {
     runtime_config: PathBuf,
 }
 
+/// 创建启动测试临时根；Windows 使用 platform 已验证的源目录父级，避免 Temp ACL 阻断 DACL fixture。
+fn fixture_tempdir() -> TempDir {
+    #[cfg(windows)]
+    {
+        tempfile::Builder::new()
+            .prefix("efflab-agent-sidecar-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("创建 Windows 临时 fixture 目录")
+    }
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().expect("创建临时 fixture 目录")
+    }
+}
+
 impl Fixture {
     /// 创建一个可被 Host 写入的 runtime-config.v1 fixture。
     fn new() -> Self {
-        let temporary = tempfile::tempdir().expect("创建临时 fixture 目录");
+        let temporary = fixture_tempdir();
         let session_cwd = temporary.path().join("session");
         let home = temporary.path().join("home");
-        fs::create_dir(&session_cwd).expect("创建 session cwd");
-        fs::create_dir(&home).expect("创建 sidecar home");
-        set_mode(&session_cwd, 0o700);
-        set_mode(&home, 0o700);
+        #[cfg(unix)]
+        {
+            fs::create_dir(&session_cwd).expect("创建 session cwd");
+            fs::create_dir(&home).expect("创建 sidecar home");
+            set_mode(&session_cwd, 0o700);
+            set_mode(&home, 0o700);
+        }
+        #[cfg(windows)]
+        {
+            // Windows 目录必须经共享平台原语创建，不能依赖继承 ACL 冒充私有目录。
+            efflab_agent_platform::create_private_directory(&session_cwd)
+                .expect("创建受保护 session cwd");
+            efflab_agent_platform::create_private_directory(&home)
+                .expect("创建受保护 sidecar home");
+        }
         let runtime_config = home.join(RUNTIME_CONFIG_FILENAME);
         write_valid_runtime_config(&runtime_config, &session_cwd, 0o600);
 
@@ -198,6 +227,7 @@ impl Fixture {
     }
 
     /// 构造带指定 L3b 绑定值的 sidecar 命令，覆盖启动边界的异常输入。
+    #[cfg(unix)]
     fn command_with_bind(&self, args: &[String], bind: Option<&str>) -> Command {
         let mut command = self.command(args);
         match bind {
@@ -212,7 +242,7 @@ impl Fixture {
     }
 }
 
-/// 写入由 contract renderer 生成的合法 v1 配置，并显式设置 Unix 文件权限。
+/// 写入由 contract renderer 生成的合法 v1 配置，并应用各平台的私有文件约束。
 fn write_valid_runtime_config(path: &Path, session_cwd: &Path, mode: u32) {
     let config = RuntimeConfigV1 {
         schema_version: 1,
@@ -233,8 +263,18 @@ fn write_valid_runtime_config(path: &Path, session_cwd: &Path, mode: u32) {
         system_prompt: String::new(),
     };
     let rendered = render_runtime_config_v1(&config).expect("生成合法 runtime config");
-    fs::write(path, rendered).expect("写入 runtime config");
-    set_mode(path, mode);
+    #[cfg(unix)]
+    {
+        fs::write(path, rendered).expect("写入 runtime config");
+        set_mode(path, mode);
+    }
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        // Windows 文件必须使用共享平台原语落盘，确保 protected DACL 可被启动句柄接受。
+        efflab_agent_platform::atomic_write_private(path, rendered.as_bytes())
+            .expect("写入受保护 runtime config");
+    }
 }
 
 /// 统一构造隔离环境，确保测试进程的用户代理、代理和 telemetry 不会泄漏给 child。
@@ -311,6 +351,18 @@ fn spawn_blocking_fixture(fixture: &Fixture) -> Child {
     child
 }
 
+#[cfg(windows)]
+/// Windows LockFileEx 用 ERROR_LOCK_VIOLATION 表示独占锁已被占用。
+fn lock_is_held(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION)
+}
+
+#[cfg(not(windows))]
+fn lock_is_held(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+}
+
 /// 等待第一进程真正持有独占锁，避免只凭锁文件存在判断启动成功。
 fn wait_for_lock(child: &mut Child, lock_path: &Path) {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -325,7 +377,7 @@ fn wait_for_lock(child: &mut Child, lock_path: &Path) {
                 .open(lock_path)
         {
             match lock_file.try_lock_exclusive() {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) if lock_is_held(&error) => return,
                 Ok(()) => {}
                 Err(_) => {}
             }
@@ -368,9 +420,6 @@ fn set_mode(path: &Path, mode: u32) {
 
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("设置测试 fixture 权限");
 }
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
 
 #[cfg(unix)]
 fn mode(path: &Path) -> u32 {
@@ -762,7 +811,7 @@ fn final_session_cwd_symlink_is_rejected_before_home_lock() {
     assert!(!fixture.home.join(HOME_LOCK_FILENAME).exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn same_home_cannot_run_two_sidecars_and_lock_releases_after_eof() {
     let fixture = Fixture::new();
@@ -941,16 +990,26 @@ fn successful_startup_emits_redacted_debug_lifecycle_logs() {
 
 #[cfg(windows)]
 #[test]
-fn windows_startup_rejects_before_reading_config_or_creating_lock() {
+fn windows_valid_startup_reads_protected_runtime_config_and_exits_cleanly() {
     let fixture = Fixture::new();
-    let original = fs::read(&fixture.runtime_config).expect("读取测试 config");
+    let original =
+        efflab_agent_platform::read_private_file(&fixture.runtime_config, MAX_RUNTIME_CONFIG_BYTES)
+            .expect("测试 runtime config 必须满足 Windows 私有文件约束");
+
     let (status, stdout, stderr) = run_to_completion(fixture.command(&fixture.args()));
 
-    assert_rejected(status, &stdout, &stderr, "sidecar_hardening_unavailable");
-    assert!(!fixture.home.join(HOME_LOCK_FILENAME).exists());
+    assert_clean_eof(status, &stdout, &stderr);
     assert_eq!(
-        fs::read(&fixture.runtime_config).expect("再次读取测试 config"),
+        efflab_agent_platform::read_private_file(
+            &fixture.runtime_config,
+            MAX_RUNTIME_CONFIG_BYTES,
+        )
+        .expect("再次读取受保护 runtime config"),
         original,
-        "Windows capability 拒绝时不得读取后改写 runtime config"
+        "sidecar 启动不得改写 Host 提供的 runtime config"
+    );
+    assert!(
+        fixture.home.join(HOME_LOCK_FILENAME).is_file(),
+        "合法启动必须创建 home lock"
     );
 }

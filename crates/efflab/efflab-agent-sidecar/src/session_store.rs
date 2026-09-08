@@ -4,7 +4,9 @@
 //! 配置、认证凭据、MCP 环境和未知 ACP payload；同时提供旧 session 的只读懒导入。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
+#[cfg(unix)]
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +17,8 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use efflab_agent_contract::{is_prompt_id, is_qualified_tool_name};
+#[cfg(windows)]
+use efflab_agent_platform as platform;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// v1 session 文件允许的最大字节数。
@@ -46,7 +50,9 @@ const LEGACY_ACP_UPDATE_METHOD: &str = "session/update";
 const LEGACY_XAI_UPDATE_METHOD: &str = "_x.ai/session/update";
 /// 与 MCP/transcript gate 一致的唯一内置工具例外；不放宽为任意 GrokBuild:*。
 const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
+#[cfg(unix)]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_LEGACY_METADATA_ID_BYTES: usize = 1024;
 /// 公开 identifier 的持久化上限，供 MCP catalog 与 transcript 共用同一边界。
@@ -515,6 +521,8 @@ impl std::error::Error for SessionError {}
 #[derive(Clone)]
 pub struct SessionRepository {
     home: PathBuf,
+    #[cfg(windows)]
+    pinned_home: Option<Arc<platform::SecureDirectory>>,
     operation_lock: Arc<Mutex<()>>,
 }
 
@@ -523,8 +531,27 @@ impl SessionRepository {
     pub fn new(home: impl Into<PathBuf>) -> Self {
         Self {
             home: home.into(),
+            #[cfg(windows)]
+            pinned_home: None,
             operation_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// 从启动阶段的句柄创建生产 repository，Windows 后续 I/O 均相对 pinned home。
+    #[cfg(windows)]
+    pub fn new_with_startup_handles(
+        home: impl Into<PathBuf>,
+        startup: crate::hardening::StartupHandles,
+    ) -> Result<Self, SessionError> {
+        let pinned_home = startup
+            .home_directory()
+            .map_err(|_| SessionError::Io)
+            .map(Arc::new)?;
+        Ok(Self {
+            home: home.into(),
+            pinned_home: Some(pinned_home),
+            operation_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// 返回 repository home 的只读引用，供 runtime 绑定路径时使用。
@@ -612,10 +639,10 @@ impl SessionRepository {
         let _guard = self.lock()?;
         ensure_storage_platform()?;
         validate_home_path(&self.home)?;
-        ensure_private_directory(&self.home)?;
-        ensure_private_directory(&self.sessions_root())?;
+        self.ensure_private_directory_at(&self.home)?;
+        self.ensure_private_directory_at(&self.sessions_root())?;
         let v1_root = self.v1_root();
-        ensure_private_directory(&v1_root)?;
+        self.ensure_private_directory_at(&v1_root)?;
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -630,7 +657,7 @@ impl SessionRepository {
         for _ in 0..GENERATED_ID_ATTEMPTS {
             let counter = GENERATED_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("session-{timestamp:x}-{counter:x}");
-            if !entry_exists(&self.session_dir(&session_id))? {
+            if !self.private_entry_exists_at(&self.session_dir(&session_id))? {
                 return self.create_session_locked(&session_id);
             }
         }
@@ -647,20 +674,20 @@ impl SessionRepository {
         ensure_storage_platform()?;
         validate_home_path(&self.home)?;
         validate_session_id(session_id)?;
-        ensure_private_directory(&self.home)?;
-        ensure_private_directory(&self.sessions_root())?;
-        ensure_private_directory(&self.v1_root())?;
+        self.ensure_private_directory_at(&self.home)?;
+        self.ensure_private_directory_at(&self.sessions_root())?;
+        self.ensure_private_directory_at(&self.v1_root())?;
         self.create_session_locked(session_id)
     }
 
     /// 在调用方已持有 repository 锁时创建目录、manifest 和空 journal。
     fn create_session_locked(&self, session_id: &str) -> Result<Session, SessionError> {
         let directory = self.session_dir(session_id);
-        if entry_exists(&directory)? {
+        if self.private_entry_exists_at(&directory)? {
             tracing::debug!(event = "session_create_existing", "拒绝覆盖既有 session");
             return Err(SessionError::Corrupt);
         }
-        create_private_directory(&directory)?;
+        self.create_private_directory_at(&directory)?;
         let manifest = Manifest {
             schema_version: SCHEMA_VERSION,
             session_id: session_id.to_owned(),
@@ -673,8 +700,8 @@ impl SessionRepository {
             partial_tail: false,
         };
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| SessionError::Io)?;
-        atomic_write(&directory.join(MANIFEST_FILE), &manifest_bytes)?;
-        atomic_write(&directory.join(RECORDS_FILE), &[])?;
+        self.atomic_write_at(&directory.join(MANIFEST_FILE), &manifest_bytes)?;
+        self.atomic_write_at(&directory.join(RECORDS_FILE), &[])?;
         tracing::debug!(event = "session_created", "v1 session 已创建");
         Ok(Session::empty(session_id))
     }
@@ -687,18 +714,14 @@ impl SessionRepository {
         let mut summaries = BTreeMap::new();
 
         if let Some(v1_root) = self.existing_v1_root()? {
-            let entries =
-                fs::read_dir(v1_root).map_err(|error| map_directory_error(error, false))?;
-            for entry in entries {
-                let entry = entry.map_err(|_| SessionError::Io)?;
-                let path = entry.path();
-                let name = entry.file_name();
+            for name in self.list_directory_names_at(&v1_root)? {
+                let path = v1_root.join(&name);
                 let Some(session_id) = name.to_str() else {
                     tracing::debug!(event = "session_list_invalid_id", "session id 不是 UTF-8");
                     return Err(SessionError::Corrupt);
                 };
                 validate_session_id(session_id).map_err(|_| SessionError::Corrupt)?;
-                verify_directory(&path)?;
+                self.verify_private_directory_at(&path)?;
                 let loaded = self.load_v1_locked(session_id)?;
                 summaries.insert(
                     session_id.to_owned(),
@@ -722,8 +745,8 @@ impl SessionRepository {
             if summaries.contains_key(&candidate.session_id) {
                 continue;
             }
-            let metadata = read_legacy_summary(&candidate.path, &candidate.session_id)?;
-            let summary_conflict = !legacy_summary_matches_candidate(&candidate, &metadata)?;
+            let metadata = read_legacy_summary(self, &candidate.path, &candidate.session_id)?;
+            let summary_conflict = !legacy_summary_matches_candidate(self, &candidate, &metadata)?;
             let duplicate = legacy_counts
                 .get(&candidate.session_id)
                 .is_some_and(|count| *count > 1);
@@ -780,13 +803,13 @@ impl SessionRepository {
             return Err(SessionError::NotFound);
         };
         let directory = self.session_dir(session_id);
-        match verify_directory(&directory) {
+        match self.verify_private_directory_at(&directory) {
             Ok(()) => {}
             Err(SessionError::NotFound) => return Err(SessionError::NotFound),
             Err(error) => return Err(error),
         }
         let manifest_path = directory.join(MANIFEST_FILE);
-        let manifest_bytes = read_bounded_file(&manifest_path)?;
+        let manifest_bytes = self.read_bounded_file_at(&manifest_path)?;
         validate_json_depth(&manifest_bytes)?;
         let manifest: Manifest = match serde_json::from_slice(&manifest_bytes) {
             Ok(manifest) => manifest,
@@ -805,7 +828,7 @@ impl SessionRepository {
         validate_session_metadata(&manifest)?;
 
         let records_path = directory.join(RECORDS_FILE);
-        let records_bytes = read_bounded_file(&records_path)?;
+        let records_bytes = self.read_bounded_file_at(&records_path)?;
         let records = parse_records(&records_bytes)?;
         tracing::debug!(
             event = "session_loaded",
@@ -833,7 +856,7 @@ impl SessionRepository {
         validate_session_id(session_id)?;
         if self.v1_session_exists(session_id)? {
             let directory = self.session_dir(session_id);
-            fs::remove_dir_all(&directory).map_err(|_| {
+            self.remove_private_directory_at(&directory).map_err(|_| {
                 tracing::debug!(event = "session_delete_failed", "删除 v1 session 目录失败");
                 SessionError::Io
             })?;
@@ -841,7 +864,7 @@ impl SessionRepository {
             return Ok(());
         }
         if let Some(candidate) = self.find_legacy_candidate(session_id)? {
-            fs::remove_dir_all(&candidate.path).map_err(|_| {
+            self.remove_directory_at(&candidate.path).map_err(|_| {
                 tracing::debug!(
                     event = "legacy_session_delete_failed",
                     "删除 legacy session 目录失败"
@@ -878,9 +901,7 @@ impl SessionRepository {
 
         // sequence 由 store 盖章；调用方传入的值只作占位，避免 turn loop 预分配撞号。
         let mut next_sequence = match session.records.last().map(SessionRecord::sequence) {
-            Some(previous) => previous
-                .checked_add(1)
-                .ok_or(SessionError::InvalidRecord)?,
+            Some(previous) => previous.checked_add(1).ok_or(SessionError::InvalidRecord)?,
             None => 0,
         };
         let mut encoded = Vec::with_capacity(records.len());
@@ -907,7 +928,7 @@ impl SessionRepository {
             return Ok(());
         }
 
-        let current = read_bounded_file(&self.records_path(session_id))?;
+        let current = self.read_bounded_file_at(&self.records_path(session_id))?;
         let separator_bytes = usize::from(!current.is_empty() && !current.ends_with(b"\n"));
         let replacement_len = current
             .len()
@@ -926,7 +947,7 @@ impl SessionRepository {
             replacement.push(b'\n');
         }
         replacement.extend_from_slice(&encoded);
-        atomic_write(&self.records_path(session_id), &replacement)?;
+        self.atomic_write_at(&self.records_path(session_id), &replacement)?;
         tracing::debug!(
             event = "session_appended",
             record_count = records.len(),
@@ -941,62 +962,43 @@ impl SessionRepository {
             return Ok(false);
         };
         let directory = v1_root.join(session_id);
-        match fs::symlink_metadata(&directory) {
-            Ok(_) => {
-                verify_directory(&directory)?;
-                Ok(true)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err(SessionError::Io),
+        if !self.private_entry_exists_at(&directory)? {
+            return Ok(false);
         }
+        self.verify_private_directory_at(&directory)?;
+        Ok(true)
     }
 
     /// 只扫描存在 summary.json 的旧目录，沿用旧 shell 的可列出判定。
     fn list_legacy_candidates(&self) -> Result<Vec<LegacyCandidate>, SessionError> {
-        let Some(sessions_root) = existing_legacy_sessions_root(&self.home)? else {
+        let Some(sessions_root) = self.existing_legacy_sessions_root()? else {
             return Ok(Vec::new());
         };
         let mut candidates = Vec::new();
-        let mut cwd_entries = fs::read_dir(sessions_root)
-            .map_err(|error| map_directory_error(error, false))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| SessionError::Io)?;
-        cwd_entries.sort_by_key(|entry| entry.file_name());
-        for cwd_entry in cwd_entries {
-            let cwd_path = cwd_entry.path();
-            verify_legacy_directory(&cwd_path)?;
-            let cwd_component = cwd_entry
-                .file_name()
-                .to_str()
-                .ok_or(SessionError::Corrupt)?
-                .to_owned();
-            let mut session_entries = fs::read_dir(&cwd_path)
-                .map_err(|_| SessionError::Io)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| SessionError::Io)?;
-            session_entries.sort_by_key(|entry| entry.file_name());
-            for session_entry in session_entries {
-                if session_entry.file_name() == std::ffi::OsStr::new(".cwd") {
+        let mut cwd_entries = self.list_directory_names_at(&sessions_root)?;
+        cwd_entries.sort();
+        for cwd_name in cwd_entries {
+            let cwd_path = sessions_root.join(&cwd_name);
+            self.verify_legacy_directory_at(&cwd_path)?;
+            let cwd_component = cwd_name.to_str().ok_or(SessionError::Corrupt)?.to_owned();
+            let mut session_entries = self.list_directory_names_at(&cwd_path)?;
+            session_entries.sort();
+            for session_name in session_entries {
+                if session_name == std::ffi::OsStr::new(".cwd") {
                     // 长 cwd 的真实旧布局在 cwd 目录旁保存一个可读 `.cwd` 元数据文件。
-                    let metadata = fs::symlink_metadata(session_entry.path()).map_err(|error| {
-                        if error.kind() == io::ErrorKind::NotFound {
-                            SessionError::Corrupt
-                        } else {
-                            SessionError::Io
-                        }
-                    })?;
-                    verify_legacy_file_metadata(&metadata)?;
+                    if !self.legacy_file_exists_at(&cwd_path, ".cwd")? {
+                        return Err(SessionError::Corrupt);
+                    }
                     continue;
                 }
-                let session_id = session_entry
-                    .file_name()
+                let session_id = session_name
                     .to_str()
                     .ok_or(SessionError::Corrupt)?
                     .to_owned();
                 validate_session_id(&session_id).map_err(|_| SessionError::Corrupt)?;
-                let session_path = session_entry.path();
-                verify_legacy_directory(&session_path)?;
-                if legacy_summary_file_exists(&session_path)? {
+                let session_path = cwd_path.join(&session_name);
+                self.verify_legacy_directory_at(&session_path)?;
+                if self.legacy_file_exists_at(&session_path, LEGACY_SUMMARY_FILE)? {
                     candidates.push(LegacyCandidate {
                         path: session_path,
                         session_id,
@@ -1034,12 +1036,18 @@ impl SessionRepository {
         candidate: &LegacyCandidate,
         policy: &LegacyToolPolicy,
     ) -> Result<Session, SessionError> {
-        let summary = read_legacy_summary(&candidate.path, &candidate.session_id)?;
-        let summary_conflict = !legacy_summary_matches_candidate(candidate, &summary)?;
-        let mut imported = if legacy_file_exists(&candidate.path, LEGACY_UPDATES_FILE)? {
-            parse_legacy_updates(&candidate.path, &candidate.session_id, &summary, policy)?
-        } else if legacy_file_exists(&candidate.path, LEGACY_CHAT_HISTORY_FILE)? {
-            parse_legacy_chat_history(&candidate.path, &candidate.session_id, &summary)?
+        let summary = read_legacy_summary(self, &candidate.path, &candidate.session_id)?;
+        let summary_conflict = !legacy_summary_matches_candidate(self, candidate, &summary)?;
+        let mut imported = if self.legacy_file_exists_at(&candidate.path, LEGACY_UPDATES_FILE)? {
+            parse_legacy_updates(
+                self,
+                &candidate.path,
+                &candidate.session_id,
+                &summary,
+                policy,
+            )?
+        } else if self.legacy_file_exists_at(&candidate.path, LEGACY_CHAT_HISTORY_FILE)? {
+            parse_legacy_chat_history(self, &candidate.path, &candidate.session_id, &summary)?
         } else {
             LegacyParseResult {
                 records: Vec::new(),
@@ -1075,23 +1083,23 @@ impl SessionRepository {
 
     /// 以临时 v1 目录加目录 rename 的方式原子发布 legacy 导入结果。
     fn write_imported_v1_locked(&self, session: &Session) -> Result<(), SessionError> {
-        ensure_private_directory(&self.home)?;
+        self.ensure_private_directory_at(&self.home)?;
         // 旧 sessions 根目录可能沿用旧 shell 的权限；只要求它是真目录，
         // 新建的 v1 根目录仍然使用 owner-only 权限。
-        verify_legacy_directory(&self.home.join(LEGACY_SESSIONS_ROOT))?;
-        ensure_private_directory(&self.v1_root())?;
+        self.verify_legacy_directory_at(&self.home.join(LEGACY_SESSIONS_ROOT))?;
+        self.ensure_private_directory_at(&self.v1_root())?;
         let final_dir = self.session_dir(&session.id);
-        if entry_exists(&final_dir)? {
+        if self.private_entry_exists_at(&final_dir)? {
             return Ok(());
         }
         let counter = LEGACY_IMPORT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temporary_dir = self
             .v1_root()
             .join(format!(".{}-import-{counter}", session.id));
-        if entry_exists(&temporary_dir)? {
+        if self.private_entry_exists_at(&temporary_dir)? {
             return Err(SessionError::Io);
         }
-        create_private_directory(&temporary_dir)?;
+        self.create_private_directory_at(&temporary_dir)?;
         let result = (|| {
             let manifest = Manifest::from_session(session);
             let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| SessionError::Io)?;
@@ -1099,16 +1107,248 @@ impl SessionRepository {
             if records_bytes.len() > MAX_SESSION_FILE_BYTES {
                 return Err(SessionError::Corrupt);
             }
-            atomic_write(&temporary_dir.join(MANIFEST_FILE), &manifest_bytes)?;
-            atomic_write(&temporary_dir.join(RECORDS_FILE), &records_bytes)?;
-            fs::rename(&temporary_dir, &final_dir).map_err(|_| SessionError::Io)?;
-            sync_directory(&self.v1_root())?;
+            self.atomic_write_at(&temporary_dir.join(MANIFEST_FILE), &manifest_bytes)?;
+            self.atomic_write_at(&temporary_dir.join(RECORDS_FILE), &records_bytes)?;
+            self.rename_directory_at(&temporary_dir, &final_dir)?;
+            self.sync_directory_at(&self.v1_root())?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_dir_all(&temporary_dir);
+            let _ = self.remove_private_directory_at(&temporary_dir);
         }
         result
+    }
+
+    /// 在 Windows 上把逻辑路径约束为 pinned home 下的相对路径。
+    #[cfg(windows)]
+    fn pinned_relative_path(&self, path: &Path) -> Result<PathBuf, SessionError> {
+        let relative = path
+            .strip_prefix(&self.home)
+            .map_err(|_| SessionError::Corrupt)?;
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        }) {
+            return Err(SessionError::Corrupt);
+        }
+        Ok(relative.to_path_buf())
+    }
+
+    /// 按 repository 模式创建或验证目录；pinned 模式绝不重新解析 home 路径。
+    fn ensure_private_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            if relative.as_os_str().is_empty() {
+                return Ok(());
+            }
+            return platform::ensure_private_directory_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        ensure_private_directory(path)
+    }
+
+    /// 按 repository 模式独占创建目录。
+    fn create_private_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::create_private_directory_relative(root, &relative).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    SessionError::Corrupt
+                } else {
+                    SessionError::Io
+                }
+            });
+        }
+        create_private_directory(path)
+    }
+
+    /// 按 repository 模式验证 owner-only 私有目录。
+    fn verify_private_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            if relative.as_os_str().is_empty() {
+                return Ok(());
+            }
+            return platform::verify_private_directory_relative(root, &relative).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    SessionError::NotFound
+                } else {
+                    SessionError::Corrupt
+                }
+            });
+        }
+        verify_private_directory(path)
+    }
+
+    /// 按 repository 模式枚举目录；Windows pinned 模式从根句柄开始。
+    fn list_directory_names_at(&self, path: &Path) -> Result<Vec<OsString>, SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::list_directory_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        list_directory_names(path)
+    }
+
+    /// 按 repository 模式递归删除目录。
+    fn remove_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::remove_directory_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        remove_directory(path)
+    }
+
+    /// 按 repository 模式递归删除 v1 私有目录。
+    fn remove_private_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::remove_private_directory_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        remove_directory(path)
+    }
+
+    /// 按 repository 模式原子发布目录。
+    fn rename_directory_at(&self, path: &Path, destination: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let source = self.pinned_relative_path(path)?;
+            let destination = self.pinned_relative_path(destination)?;
+            return platform::rename_private_directory_relative(root, &source, &destination)
+                .map_err(|_| SessionError::Io);
+        }
+        rename_directory(path, destination)
+    }
+
+    /// 按 repository 模式刷新目录元数据。
+    fn sync_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::sync_private_directory_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        sync_directory(path)
+    }
+
+    /// 按 repository 模式检查 v1 私有目录项是否存在。
+    fn private_entry_exists_at(&self, path: &Path) -> Result<bool, SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::path_entry_exists_private_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        entry_exists(path)
+    }
+
+    /// 按 repository 模式读取 v1 私有文件。
+    fn read_bounded_file_at(&self, path: &Path) -> Result<Vec<u8>, SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::read_private_file_relative(root, &relative, MAX_SESSION_FILE_BYTES)
+                .map_err(|error| {
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                    ) {
+                        tracing::debug!(
+                            event = "session_file_missing_or_invalid",
+                            "session 文件缺失或超过限制"
+                        );
+                        SessionError::Corrupt
+                    } else {
+                        tracing::debug!(
+                            event = "session_file_read_failed",
+                            "读取 session 文件失败"
+                        );
+                        SessionError::Io
+                    }
+                });
+        }
+        read_bounded_file(path)
+    }
+
+    /// 按 repository 模式原子写入 v1 私有文件。
+    fn atomic_write_at(&self, path: &Path, content: &[u8]) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            tracing::debug!(
+                event = "session_atomic_write_started",
+                bytes = content.len(),
+                "开始原子写 session 文件"
+            );
+            platform::atomic_write_private_relative(root, &relative, content)
+                .map_err(|_| SessionError::Io)?;
+            tracing::debug!(
+                event = "session_atomic_write_committed",
+                bytes = content.len(),
+                "session 原子写入已提交"
+            );
+            return Ok(());
+        }
+        atomic_write(path, content)
+    }
+
+    /// 按 repository 模式读取 legacy 普通文件，保留旧格式较宽权限语义。
+    fn read_legacy_file_at(&self, path: &Path) -> Result<Vec<u8>, SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::read_regular_file_relative(root, &relative, MAX_SESSION_FILE_BYTES)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        SessionError::Corrupt
+                    } else {
+                        SessionError::Io
+                    }
+                });
+        }
+        read_legacy_file(path)
+    }
+
+    /// 按 repository 模式检查 legacy 固定文件是否存在。
+    fn legacy_file_exists_at(
+        &self,
+        session_dir: &Path,
+        file_name: &str,
+    ) -> Result<bool, SessionError> {
+        let path = session_dir.join(file_name);
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(&path)?;
+            return platform::path_entry_exists_relative(root, &relative)
+                .map_err(|_| SessionError::Io);
+        }
+        legacy_file_exists(session_dir, file_name)
+    }
+
+    /// 按 repository 模式校验 legacy 目录。
+    fn verify_legacy_directory_at(&self, path: &Path) -> Result<(), SessionError> {
+        #[cfg(windows)]
+        if let Some(root) = &self.pinned_home {
+            let relative = self.pinned_relative_path(path)?;
+            return platform::verify_directory_relative(root, &relative).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    SessionError::NotFound
+                } else {
+                    SessionError::Corrupt
+                }
+            });
+        }
+        verify_legacy_directory(path)
     }
 
     /// 返回 sessions 根目录。
@@ -1133,20 +1373,35 @@ impl SessionRepository {
 
     /// 只打开现有 v1 根，缺失时由 list/load 分别解释为 empty/not-found。
     fn existing_v1_root(&self) -> Result<Option<PathBuf>, SessionError> {
-        match verify_directory(&self.home) {
+        match self.verify_private_directory_at(&self.home) {
             Ok(()) => {}
             Err(SessionError::NotFound) => return Ok(None),
             Err(error) => return Err(error),
         }
         // 读取 legacy 时不能要求旧 sessions 根已经满足 v1 的 0700；
         // v1 自己的根目录仍在下方单独执行严格权限校验。
-        match verify_legacy_directory(&self.sessions_root()) {
+        match self.verify_legacy_directory_at(&self.sessions_root()) {
             Ok(()) => {}
             Err(SessionError::NotFound) => return Ok(None),
             Err(error) => return Err(error),
         }
-        match verify_directory(&self.v1_root()) {
+        match self.verify_private_directory_at(&self.v1_root()) {
             Ok(()) => Ok(Some(self.v1_root())),
+            Err(SessionError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 从 pinned home 检查已有 legacy sessions 根，避免按替换后的路径重新解析。
+    fn existing_legacy_sessions_root(&self) -> Result<Option<PathBuf>, SessionError> {
+        match self.verify_private_directory_at(&self.home) {
+            Ok(()) => {}
+            Err(SessionError::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let sessions_root = self.home.join(LEGACY_SESSIONS_ROOT);
+        match self.verify_legacy_directory_at(&sessions_root) {
+            Ok(()) => Ok(Some(sessions_root)),
             Err(SessionError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -1217,11 +1472,11 @@ fn validate_home_path(path: &Path) -> Result<(), SessionError> {
 
 /// 当前 sidecar 的非 Unix hardening 尚未 proven，因此存储也保持 fail-closed。
 fn ensure_storage_platform() -> Result<(), SessionError> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         tracing::debug!(
             event = "session_store_platform_unavailable",
@@ -1231,6 +1486,106 @@ fn ensure_storage_platform() -> Result<(), SessionError> {
     }
 }
 
+#[cfg(unix)]
+fn list_directory_names(path: &Path) -> Result<Vec<OsString>, SessionError> {
+    fs::read_dir(path)
+        .map_err(|error| map_directory_error(error, false))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|_| SessionError::Io)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn list_directory_names(path: &Path) -> Result<Vec<OsString>, SessionError> {
+    platform::list_directory(path).map_err(|_| SessionError::Io)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn list_directory_names(_path: &Path) -> Result<Vec<OsString>, SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
+}
+
+#[cfg(unix)]
+fn remove_directory(path: &Path) -> Result<(), SessionError> {
+    fs::remove_dir_all(path).map_err(|_| SessionError::Io)
+}
+
+#[cfg(windows)]
+fn remove_directory(path: &Path) -> Result<(), SessionError> {
+    platform::remove_directory(path).map_err(|_| SessionError::Io)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn remove_directory(_path: &Path) -> Result<(), SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
+}
+
+#[cfg(unix)]
+fn rename_directory(path: &Path, destination: &Path) -> Result<(), SessionError> {
+    fs::rename(path, destination).map_err(|_| SessionError::Io)
+}
+
+#[cfg(windows)]
+fn rename_directory(path: &Path, destination: &Path) -> Result<(), SessionError> {
+    platform::rename_directory(path, destination).map_err(|_| SessionError::Io)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn rename_directory(_path: &Path, _destination: &Path) -> Result<(), SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), SessionError> {
+    let directory = fs::File::open(path).map_err(|_| SessionError::Io)?;
+    directory.sync_all().map_err(|_| SessionError::Io)
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), SessionError> {
+    platform::sync_directory(path).map_err(|_| SessionError::Io)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn sync_directory(_path: &Path) -> Result<(), SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
+}
+
+#[cfg(windows)]
+fn verify_private_directory(path: &Path) -> Result<(), SessionError> {
+    platform::verify_private_directory(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            SessionError::NotFound
+        } else {
+            SessionError::Corrupt
+        }
+    })
+}
+
+#[cfg(windows)]
+fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
+    platform::ensure_private_directory(path).map_err(|_| SessionError::Io)
+}
+
+#[cfg(windows)]
+fn create_private_directory(path: &Path) -> Result<(), SessionError> {
+    platform::create_private_directory(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            SessionError::Corrupt
+        } else {
+            SessionError::Io
+        }
+    })
+}
+
+#[cfg(unix)]
 /// 逐级创建私有目录，并拒绝现有 symlink 或共享权限目录。
 fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
     validate_home_path(path)?;
@@ -1260,6 +1615,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
     verify_private_directory(&current)
 }
 
+#[cfg(unix)]
 /// 创建 session 最终目录，不允许覆盖任何既有目录项。
 fn create_private_directory(path: &Path) -> Result<(), SessionError> {
     fs::create_dir(path).map_err(|error| {
@@ -1273,6 +1629,7 @@ fn create_private_directory(path: &Path) -> Result<(), SessionError> {
     verify_private_directory(path)
 }
 
+#[cfg(unix)]
 /// 校验目录路径上的每一级目录项都不是 symlink。
 fn verify_directory_components(path: &Path) -> Result<(), SessionError> {
     validate_home_path(path)?;
@@ -1291,21 +1648,8 @@ fn verify_directory_components(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// 校验现有目录不是 symlink 且使用 owner-only 权限。
-fn verify_directory(path: &Path) -> Result<(), SessionError> {
-    verify_directory_components(path)?;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            SessionError::NotFound
-        } else {
-            SessionError::Io
-        }
-    })?;
-    verify_directory_metadata(&metadata)?;
-    verify_private_directory(path)
-}
-
 /// 校验目录元数据；先检查 symlink 再检查常规目录类型。
+#[cfg(unix)]
 fn verify_directory_metadata(metadata: &Metadata) -> Result<(), SessionError> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         tracing::debug!(
@@ -1317,37 +1661,23 @@ fn verify_directory_metadata(metadata: &Metadata) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// 校验最终私有目录权限；Windows 由上层 capability gate fail-closed。
+/// 校验最终私有目录权限；Windows 由共享平台原语检查 DACL。
+#[cfg(unix)]
 fn verify_private_directory(path: &Path) -> Result<(), SessionError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| SessionError::Io)?;
     verify_directory_metadata(&metadata)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o7777 != PRIVATE_DIRECTORY_MODE {
-            tracing::debug!(
-                event = "session_directory_mode_invalid",
-                "session 目录权限不是 0700"
-            );
-            return Err(SessionError::Corrupt);
-        }
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o7777 != PRIVATE_DIRECTORY_MODE {
+        tracing::debug!(
+            event = "session_directory_mode_invalid",
+            "session 目录权限不是 0700"
+        );
+        return Err(SessionError::Corrupt);
     }
     Ok(())
 }
 
-/// 新建目录后立即收紧权限；不修复预先存在的共享目录。
-fn set_private_directory_mode(path: &Path) -> Result<(), SessionError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|_| SessionError::Io)?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
+#[cfg(unix)]
 /// 判断目录项是否存在，同时把 symlink 留给后续安全校验处理。
 fn entry_exists(path: &Path) -> Result<bool, SessionError> {
     match fs::symlink_metadata(path) {
@@ -1357,7 +1687,13 @@ fn entry_exists(path: &Path) -> Result<bool, SessionError> {
     }
 }
 
+#[cfg(windows)]
+fn entry_exists(path: &Path) -> Result<bool, SessionError> {
+    platform::path_entry_exists(path).map_err(|_| SessionError::Io)
+}
+
 /// 读取固定上限的私有常规文件，拒绝 symlink、硬链接和不安全权限。
+#[cfg(unix)]
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>, SessionError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -1376,60 +1712,78 @@ fn read_bounded_file(path: &Path) -> Result<Vec<u8>, SessionError> {
         tracing::debug!(event = "session_file_limit", "session 文件超过 32 MiB 上限");
         return Err(SessionError::Corrupt);
     }
-    #[cfg(unix)]
-    {
-        use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt;
 
-        // O_NOFOLLOW 让最终文件项在检查与读取之间被替换为 symlink 时也拒绝打开。
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|_| {
-                tracing::debug!(event = "session_file_open_failed", "打开 session 文件失败");
-                SessionError::Io
-            })?;
-        let opened_metadata = file.metadata().map_err(|_| {
-            tracing::debug!(
-                event = "session_file_metadata_failed",
-                "读取 session 文件元数据失败"
-            );
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // O_NOFOLLOW 让最终文件项在检查与读取之间被替换为 symlink 时也拒绝打开。
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| {
+            tracing::debug!(event = "session_file_open_failed", "打开 session 文件失败");
             SessionError::Io
         })?;
-        verify_regular_file_metadata(&opened_metadata)?;
-        if opened_metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
-            tracing::debug!(
-                event = "session_file_raced_limit",
-                "打开后发现 session 文件超限"
-            );
-            return Err(SessionError::Corrupt);
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_SESSION_FILE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| {
-                tracing::debug!(event = "session_file_read_failed", "读取 session 文件失败");
-                SessionError::Io
-            })?;
-        if bytes.len() > MAX_SESSION_FILE_BYTES {
-            tracing::debug!(
-                event = "session_file_raced_limit",
-                "读取后发现 session 文件超限"
-            );
-            return Err(SessionError::Corrupt);
-        }
-        return Ok(bytes);
+    let opened_metadata = file.metadata().map_err(|_| {
+        tracing::debug!(
+            event = "session_file_metadata_failed",
+            "读取 session 文件元数据失败"
+        );
+        SessionError::Io
+    })?;
+    verify_regular_file_metadata(&opened_metadata)?;
+    if opened_metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
+        tracing::debug!(
+            event = "session_file_raced_limit",
+            "打开后发现 session 文件超限"
+        );
+        return Err(SessionError::Corrupt);
     }
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            tracing::debug!(event = "session_file_read_failed", "读取 session 文件失败");
+            SessionError::Io
+        })?;
+    if bytes.len() > MAX_SESSION_FILE_BYTES {
+        tracing::debug!(
+            event = "session_file_raced_limit",
+            "读取后发现 session 文件超限"
+        );
+        return Err(SessionError::Corrupt);
+    }
+    Ok(bytes)
+}
 
-    #[cfg(not(unix))]
-    {
-        ensure_storage_platform()?;
-        Err(SessionError::Io)
-    }
+#[cfg(windows)]
+fn read_bounded_file(path: &Path) -> Result<Vec<u8>, SessionError> {
+    platform::read_private_file(path, MAX_SESSION_FILE_BYTES).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+        ) {
+            tracing::debug!(
+                event = "session_file_missing_or_invalid",
+                "session 文件缺失或超过限制"
+            );
+            SessionError::Corrupt
+        } else {
+            tracing::debug!(event = "session_file_read_failed", "读取 session 文件失败");
+            SessionError::Io
+        }
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn read_bounded_file(_path: &Path) -> Result<Vec<u8>, SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
 }
 
 /// 校验文件类型、Unix owner-only mode 和单 inode 链接数。
+#[cfg(unix)]
 fn verify_regular_file_metadata(metadata: &Metadata) -> Result<(), SessionError> {
     let file_type = metadata.file_type();
     if file_type.is_symlink() || !file_type.is_file() {
@@ -1460,9 +1814,9 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), SessionError> {
         bytes = content.len(),
         "开始原子写 session 文件"
     );
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let result = crate::hardening::atomic_write_private(path, content);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let result: anyhow::Result<()> = Err(anyhow::anyhow!("session storage unavailable"));
     result.map_err(|_| {
         tracing::debug!(
@@ -1668,6 +2022,7 @@ fn validate_text_size(value: &str) -> Result<(), SessionError> {
 }
 
 /// 把目录读取错误收敛成不泄露路径的稳定分类。
+#[cfg(unix)]
 fn map_directory_error(error: io::Error, missing_is_not_found: bool) -> SessionError {
     if missing_is_not_found && error.kind() == io::ErrorKind::NotFound {
         SessionError::NotFound
@@ -1731,10 +2086,11 @@ enum LegacyUpdateKind {
 
 /// 读取旧 summary 的最小安全字段；未知业务字段由旧格式演进自行保留。
 fn read_legacy_summary(
+    repository: &SessionRepository,
     session_dir: &Path,
     expected_session_id: &str,
 ) -> Result<LegacySummaryMetadata, SessionError> {
-    let bytes = read_legacy_file(&session_dir.join(LEGACY_SUMMARY_FILE))?;
+    let bytes = repository.read_legacy_file_at(&session_dir.join(LEGACY_SUMMARY_FILE))?;
     validate_json_depth(&bytes)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
         tracing::debug!(
@@ -1865,17 +2221,18 @@ fn hex_value(value: u8) -> Option<u8> {
 }
 
 /// 从旧 cwd 目录恢复可核对的原始路径；长路径使用 `.cwd` 元数据文件。
-fn legacy_candidate_cwd(candidate: &LegacyCandidate) -> Result<Option<String>, SessionError> {
+fn legacy_candidate_cwd(
+    repository: &SessionRepository,
+    candidate: &LegacyCandidate,
+) -> Result<Option<String>, SessionError> {
     if let Some(cwd) = decode_legacy_cwd(&candidate.cwd_component) {
         return Ok(Some(cwd));
     }
     let cwd_dir = candidate.path.parent().ok_or(SessionError::Corrupt)?;
-    let cwd_file = cwd_dir.join(".cwd");
-    let bytes = match fs::symlink_metadata(&cwd_file) {
-        Ok(_) => read_legacy_file(&cwd_file)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(SessionError::Io),
-    };
+    if !repository.legacy_file_exists_at(cwd_dir, ".cwd")? {
+        return Ok(None);
+    }
+    let bytes = repository.read_legacy_file_at(&cwd_dir.join(".cwd"))?;
     let cwd = String::from_utf8(bytes)
         .map_err(|_| SessionError::Corrupt)?
         .trim()
@@ -1891,14 +2248,16 @@ fn legacy_candidate_cwd(candidate: &LegacyCandidate) -> Result<Option<String>, S
 
 /// summary 与目录位置必须一致，否则只能作为只读历史展示。
 fn legacy_summary_matches_candidate(
+    repository: &SessionRepository,
     candidate: &LegacyCandidate,
     summary: &LegacySummaryMetadata,
 ) -> Result<bool, SessionError> {
     Ok(summary.session_id == candidate.session_id
-        && legacy_candidate_cwd(candidate)?.is_some_and(|cwd| cwd == summary.cwd))
+        && legacy_candidate_cwd(repository, candidate)?.is_some_and(|cwd| cwd == summary.cwd))
 }
 
 /// 读取旧格式文件：允许旧 shell 的 0644 文件，但仍拒绝 symlink、硬链接和超限。
+#[cfg(unix)]
 fn read_legacy_file(path: &Path) -> Result<Vec<u8>, SessionError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -1908,52 +2267,59 @@ fn read_legacy_file(path: &Path) -> Result<Vec<u8>, SessionError> {
         }
     })?;
     verify_legacy_file_metadata(&metadata)?;
-    #[cfg(unix)]
-    {
-        use std::io::Read as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|_| SessionError::Io)?;
-        let opened_metadata = file.metadata().map_err(|_| SessionError::Io)?;
-        verify_legacy_file_metadata(&opened_metadata)?;
-        let mut bytes = Vec::new();
-        file.take(MAX_SESSION_FILE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| SessionError::Io)?;
-        if bytes.len() > MAX_SESSION_FILE_BYTES {
-            return Err(SessionError::Corrupt);
+
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW 让最终文件项在检查与读取之间被替换为 symlink 时也拒绝打开。
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| SessionError::Io)?;
+    let opened_metadata = file.metadata().map_err(|_| SessionError::Io)?;
+    verify_legacy_file_metadata(&opened_metadata)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SessionError::Io)?;
+    if bytes.len() > MAX_SESSION_FILE_BYTES {
+        return Err(SessionError::Corrupt);
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn read_legacy_file(path: &Path) -> Result<Vec<u8>, SessionError> {
+    platform::read_regular_file(path, MAX_SESSION_FILE_BYTES).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            SessionError::Corrupt
+        } else {
+            SessionError::Io
         }
-        return Ok(bytes);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(SessionError::Io)
-    }
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn read_legacy_file(_path: &Path) -> Result<Vec<u8>, SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
 }
 
 /// 校验旧格式文件的常规文件类型、单 inode 和固定大小上限。
+#[cfg(unix)]
 fn verify_legacy_file_metadata(metadata: &Metadata) -> Result<(), SessionError> {
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(SessionError::Corrupt);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(SessionError::Corrupt);
-        }
-    }
-    if metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() != 1 || metadata.len() > MAX_SESSION_FILE_BYTES as u64 {
         return Err(SessionError::Corrupt);
     }
     Ok(())
 }
 
 /// 判断 legacy 固定文件是否存在；存在但类型不安全时不把它当作缺失。
+#[cfg(unix)]
 fn legacy_file_exists(session_dir: &Path, file_name: &str) -> Result<bool, SessionError> {
     match fs::symlink_metadata(session_dir.join(file_name)) {
         Ok(metadata) => {
@@ -1965,11 +2331,20 @@ fn legacy_file_exists(session_dir: &Path, file_name: &str) -> Result<bool, Sessi
     }
 }
 
-fn legacy_summary_file_exists(session_dir: &Path) -> Result<bool, SessionError> {
-    legacy_file_exists(session_dir, LEGACY_SUMMARY_FILE)
+#[cfg(windows)]
+fn legacy_file_exists(session_dir: &Path, file_name: &str) -> Result<bool, SessionError> {
+    let path = session_dir.join(file_name);
+    platform::path_entry_exists(&path).map_err(|_| SessionError::Io)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn legacy_file_exists(_session_dir: &Path, _file_name: &str) -> Result<bool, SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
 }
 
 /// 旧目录只要求每一级是真目录；其最终 v1 目录仍由严格 0700 校验保护。
+#[cfg(unix)]
 fn verify_legacy_directory(path: &Path) -> Result<(), SessionError> {
     validate_home_path(path)?;
     let mut current = PathBuf::new();
@@ -1987,19 +2362,21 @@ fn verify_legacy_directory(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// 只打开已有 legacy sessions 根，避免读取时创建目录或修改旧文件。
-fn existing_legacy_sessions_root(repository_home: &Path) -> Result<Option<PathBuf>, SessionError> {
-    match verify_directory(repository_home) {
-        Ok(()) => {}
-        Err(SessionError::NotFound) => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    let sessions_root = repository_home.join(LEGACY_SESSIONS_ROOT);
-    match verify_legacy_directory(&sessions_root) {
-        Ok(()) => Ok(Some(sessions_root)),
-        Err(SessionError::NotFound) => Ok(None),
-        Err(error) => Err(error),
-    }
+#[cfg(windows)]
+fn verify_legacy_directory(path: &Path) -> Result<(), SessionError> {
+    platform::verify_directory(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            SessionError::NotFound
+        } else {
+            SessionError::Corrupt
+        }
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn verify_legacy_directory(_path: &Path) -> Result<(), SessionError> {
+    ensure_storage_platform()?;
+    Err(SessionError::Io)
 }
 
 /// 将旧 JSONL 分割为受单行和总记录数限制的借用切片。
@@ -2321,12 +2698,13 @@ fn legacy_update_kind(tag: &str) -> Option<LegacyUpdateKind> {
 
 /// 从 updates.jsonl 映射最小 transcript，并在边界不安全时只读或失败。
 fn parse_legacy_updates(
+    repository: &SessionRepository,
     session_dir: &Path,
     session_id: &str,
     summary: &LegacySummaryMetadata,
     policy: &LegacyToolPolicy,
 ) -> Result<LegacyParseResult, SessionError> {
-    let bytes = read_legacy_file(&session_dir.join(LEGACY_UPDATES_FILE))?;
+    let bytes = repository.read_legacy_file_at(&session_dir.join(LEGACY_UPDATES_FILE))?;
     let lines = legacy_lines(&bytes)?;
     let mut result = LegacyParseResult::default();
     let mut active = None;
@@ -2594,11 +2972,12 @@ fn parse_legacy_updates(
 
 /// 从 version 0/1 chat_history.jsonl 提取可展示文本；不恢复未知 payload。
 fn parse_legacy_chat_history(
+    repository: &SessionRepository,
     session_dir: &Path,
     session_id: &str,
     summary: &LegacySummaryMetadata,
 ) -> Result<LegacyParseResult, SessionError> {
-    let bytes = read_legacy_file(&session_dir.join(LEGACY_CHAT_HISTORY_FILE))?;
+    let bytes = repository.read_legacy_file_at(&session_dir.join(LEGACY_CHAT_HISTORY_FILE))?;
     let lines = legacy_lines(&bytes)?;
     let mut result = LegacyParseResult {
         read_only: true,
@@ -2765,12 +3144,6 @@ fn legacy_chat_content(value: &serde_json::Value) -> Result<(String, bool), Sess
     }
     validate_text_size(&text)?;
     Ok((text, unsupported))
-}
-
-/// legacy 读取成功后用于原子目录发布的目录同步。
-fn sync_directory(path: &Path) -> Result<(), SessionError> {
-    let directory = fs::File::open(path).map_err(|_| SessionError::Io)?;
-    directory.sync_all().map_err(|_| SessionError::Io)
 }
 
 /// 将白名单 records 编码成 v1 JSONL，防止导入阶段绕过 Task 15 限制。
@@ -3192,9 +3565,10 @@ impl<'de> Deserialize<'de> for SessionRecord {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::SessionError;
     use super::{
-        MAX_JSON_DEPTH, SessionError, SessionRecord, SessionRepository, validate_json_depth,
-        validate_session_id,
+        MAX_JSON_DEPTH, SessionRecord, SessionRepository, validate_json_depth, validate_session_id,
     };
 
     #[test]
@@ -3239,5 +3613,110 @@ mod tests {
             repository.delete(&session.id).await,
             Err(SessionError::NotFound)
         ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pinned_startup_home_survives_path_replacement_for_v1_storage() {
+        use std::fs;
+
+        let temporary = tempfile::Builder::new()
+            .prefix("efflab-session-pinned-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("创建 Windows pinned session 临时目录");
+        let home = temporary.path().join("home");
+        let session_cwd = temporary.path().join("session-cwd");
+        efflab_agent_platform::create_private_directory(&home).expect("创建 pinned home");
+        efflab_agent_platform::create_private_directory(&session_cwd)
+            .expect("创建 pinned session cwd");
+        let startup = crate::hardening::open_startup_handles(&home, &session_cwd)
+            .expect("打开 pinned startup handles");
+        let repository = SessionRepository::new_with_startup_handles(&home, startup)
+            .expect("创建 pinned session repository");
+
+        let moved_home = temporary.path().join("moved-home");
+        fs::rename(&home, &moved_home).expect("移动已钉住的 home");
+        efflab_agent_platform::create_private_directory(&home).expect("创建替换 home");
+        let decoy_v1 = home.join("efflab-sessions").join("v1");
+        efflab_agent_platform::ensure_private_directory(&decoy_v1)
+            .expect("创建替换 home 的 decoy v1 根");
+        let decoy_session = decoy_v1.join("pinned-session");
+        efflab_agent_platform::create_private_directory(&decoy_session)
+            .expect("创建替换 home 的 decoy session");
+
+        let session = repository
+            .create_with_id("pinned-session")
+            .await
+            .expect("session 应写入已钉住的 home");
+        assert!(
+            moved_home
+                .join("efflab-sessions")
+                .join("v1")
+                .join(&session.id)
+                .join("manifest.json")
+                .exists(),
+            "v1 session 必须写入原 home"
+        );
+        assert!(
+            !home
+                .join("efflab-sessions")
+                .join("v1")
+                .join("pinned-session")
+                .join("manifest.json")
+                .exists(),
+            "替换后的同名 home 不得收到 session 文件"
+        );
+
+        let listed = repository.list().await.expect("列出 pinned session");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["pinned-session"]
+        );
+        let loaded = repository
+            .load("pinned-session")
+            .await
+            .expect("加载 pinned session");
+        assert!(loaded.records.is_empty());
+
+        repository
+            .append(
+                "pinned-session",
+                &[SessionRecord::user(0, "prompt-1", "pinned content")],
+            )
+            .await
+            .expect("追加 pinned session");
+        let loaded = repository
+            .load("pinned-session")
+            .await
+            .expect("重新加载 pinned session");
+        assert_eq!(loaded.records.len(), 1);
+        assert!(
+            std::fs::read_to_string(
+                moved_home
+                    .join("efflab-sessions")
+                    .join("v1")
+                    .join("pinned-session")
+                    .join("records.jsonl")
+            )
+            .expect("读取原 home records")
+            .contains("pinned content")
+        );
+
+        repository
+            .delete("pinned-session")
+            .await
+            .expect("删除 pinned session");
+        assert!(
+            !moved_home
+                .join("efflab-sessions")
+                .join("v1")
+                .join("pinned-session")
+                .exists(),
+            "删除必须作用于原 home"
+        );
+        assert!(decoy_session.exists(), "替换后的 decoy session 不得被删除");
     }
 }

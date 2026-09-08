@@ -13,6 +13,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 efflab-agent-contract = { path = "../efflab-agent-contract" }
+efflab-agent-platform = { path = "../efflab-agent-platform" }
 libc = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -25,6 +26,9 @@ xai-tty-utils = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Windows 定向硬化测试直接调用文件系统 API，必须声明直接测试依赖。
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true

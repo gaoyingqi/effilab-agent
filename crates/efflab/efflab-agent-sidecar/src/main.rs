@@ -108,7 +108,7 @@ fn main() -> ExitCode {
         }
     };
     let local = tokio::task::LocalSet::new();
-    match runtime.block_on(local.run_until(run_acp(sidecar))) {
+    match runtime.block_on(local.run_until(run_acp(sidecar, startup_handles))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(event = "runtime_failed", %error, "sidecar runtime 失败");

@@ -25,6 +25,7 @@ MANIFEST="$ROOT/Cargo.toml"
 MEMBERS=(
   "crates/efflab/efflab-agent-contract"
   "crates/efflab/efflab-agent-host"
+  "crates/efflab/efflab-agent-platform"
   "crates/efflab/efflab-agent-sidecar"
 )
 ANCHOR_MEMBER="prod/mc/cli-chat-proxy-types"

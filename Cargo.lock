@@ -2969,6 +2969,7 @@ dependencies = [
  "base64",
  "blake3",
  "efflab-agent-contract",
+ "efflab-agent-platform",
  "libc",
  "reqwest 0.12.24",
  "ring",
@@ -2978,7 +2979,15 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "windows 0.61.3",
  "xai-tty-utils",
+]
+
+[[package]]
+name = "efflab-agent-platform"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -2992,6 +3001,7 @@ dependencies = [
  "clap",
  "dunce",
  "efflab-agent-contract",
+ "efflab-agent-platform",
  "fs2",
  "libc",
  "reqwest 0.13.4",

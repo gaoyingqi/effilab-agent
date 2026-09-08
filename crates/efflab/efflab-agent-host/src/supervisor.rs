@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -18,12 +20,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use efflab_agent_contract::{LoopbackModelSpec, RuntimeConfigV1, render_runtime_config_v1};
-use xai_tty_utils::{ProcessGroup, ProcessScope, detach_std_command};
+#[cfg(not(windows))]
+use xai_tty_utils::detach_std_command;
+use xai_tty_utils::{ProcessGroup, ProcessScope, detach_std_command_suspended};
 
 use crate::HostRuntimeConfig;
 use crate::app_port::ApprovedMcpSpecV1;
 use crate::llm_channel::LlmChannelManager;
 use crate::llm_loopback::{BindingToken, BindingTokenRegistry, L3bLoopback};
+#[cfg(windows)]
+use efflab_agent_platform as platform;
 
 /// 关闭 stdin 后等待 sidecar 自然退出的固定宽限期。
 pub const STDIN_CLOSE_GRACE: Duration = Duration::from_millis(3_500);
@@ -754,17 +760,22 @@ fn spawn_enrolled_sidecar(
     command: &mut Command,
     process_scope: &ProcessScope,
 ) -> Result<(Child, Arc<ProcessGroup>), SupervisorError> {
-    // Unix `setsid` / Windows CREATE_NO_WINDOW 令 ProcessGroup 只覆盖这棵 sidecar tree。
+    // Unix 使用进程组；Windows 使用 CREATE_SUSPENDED，先入 Job 再恢复主线程。
+    #[cfg(windows)]
+    detach_std_command_suspended(command);
+    #[cfg(not(windows))]
     detach_std_command(command);
     #[allow(clippy::disallowed_methods)]
-    // 这是 std child 到 ProcessScope 的受控桥接；下一步必定 attach_std + register，
-    // 所以 child 不会以未登记状态离开本函数。
+    // 这是 std child 到 ProcessScope 的受控桥接；下一步必定 attach + register。
     let mut child = command.spawn().map_err(|source| SupervisorError::Io {
         operation: "spawn",
         source,
     })?;
 
     let process_group = match ProcessGroup::new().and_then(|mut group| {
+        #[cfg(windows)]
+        group.attach_suspended_std(&child)?;
+        #[cfg(not(windows))]
         group.attach_std(&child)?;
         Ok(Arc::new(group))
     }) {
@@ -1183,14 +1194,30 @@ fn render_runtime_config(
 
 /// Host 在 renderer 写盘前逐级创建自己的隔离目录，并拒绝祖先符号链接。
 fn prepare_scope_directories(paths: &ScopePaths) -> Result<(), SupervisorError> {
-    for directory in [&paths.home, &paths.workspace] {
-        ensure_host_owned_directory(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        let metadata =
-            fs::symlink_metadata(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        ensure_plain_directory(&metadata).map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        set_private_directory_mode(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+    #[cfg(windows)]
+    {
+        for directory in [&paths.home, &paths.workspace] {
+            platform::ensure_private_directory(directory)
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            platform::verify_private_directory(directory)
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        }
+        return Ok(());
     }
-    Ok(())
+
+    #[cfg(not(windows))]
+    {
+        for directory in [&paths.home, &paths.workspace] {
+            ensure_host_owned_directory(directory)
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            let metadata =
+                fs::symlink_metadata(directory).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            ensure_plain_directory(&metadata).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            set_private_directory_mode(directory)
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        }
+        Ok(())
+    }
 }
 
 /// 逐级检查并创建目录，避免 `create_dir_all` 沿祖先符号链接写到 Host 范围外。
@@ -1243,54 +1270,61 @@ fn set_private_directory_mode(path: &Path) -> io::Result<()> {
 
 /// 原子物化 contract renderer 的完整 TOML；Host 是该文件的唯一写盘 owner。
 fn write_authoritative_config(path: &Path, content: &[u8]) -> Result<(), SupervisorError> {
-    let parent = path.parent().ok_or(SupervisorError::ConfigWriteFailed)?;
-    ensure_host_owned_directory(parent).map_err(|_| SupervisorError::ConfigWriteFailed)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(SupervisorError::ConfigWriteFailed);
-        }
-        Ok(_) => {}
-        // 只有不存在旧配置时才能继续创建；权限、I/O 等其它元数据错误必须 fail-closed。
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(SupervisorError::ConfigWriteFailed),
-    }
-    let file_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or(SupervisorError::ConfigWriteFailed)?;
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        platform::atomic_write_private(path, content)
+            .map_err(|_| SupervisorError::ConfigWriteFailed)
     }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|_| SupervisorError::ConfigWriteFailed)?;
-    let write_result = (|| -> Result<(), SupervisorError> {
-        file.write_all(content)
-            .map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        file.sync_all()
-            .map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        fs::rename(&temporary, path).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+    #[cfg(not(windows))]
+    {
+        let parent = path.parent().ok_or(SupervisorError::ConfigWriteFailed)?;
+        ensure_host_owned_directory(parent).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(SupervisorError::ConfigWriteFailed);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SupervisorError::ConfigWriteFailed),
+        }
+        let file_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or(SupervisorError::ConfigWriteFailed)?;
+        let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        let _ = fs::remove_file(&temporary);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        let mut file = options
+            .open(&temporary)
             .map_err(|_| SupervisorError::ConfigWriteFailed)?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let write_result = (|| -> Result<(), SupervisorError> {
+            file.write_all(content)
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            file.sync_all()
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            fs::rename(&temporary, path).map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            }
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result
     }
-    write_result
 }
 
 /// 以追加方式打开 sidecar 独立日志文件；父目录不存在时创建。
@@ -1298,62 +1332,75 @@ fn write_authoritative_config(path: &Path, content: &[u8]) -> Result<(), Supervi
 /// 该文件只接收 sidecar stderr（tracing / 启动 eprintln），不得占用 ACP stdout。
 fn open_sidecar_log_file(path: &Path) -> Result<File, SupervisorError> {
     validate_absolute_path(path)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or(SupervisorError::InvalidPathComponent)?;
-    ensure_host_owned_directory(parent).map_err(|source| SupervisorError::Io {
-        operation: "创建 sidecar 日志目录",
-        source,
-    })?;
-    set_private_directory_mode(parent).map_err(|source| SupervisorError::Io {
-        operation: "收紧 sidecar 日志目录权限",
-        source,
-    })?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(SupervisorError::Io {
-                operation: "打开 sidecar 日志文件",
-                source: io::Error::other("sidecar 日志路径必须是普通文件"),
-            });
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(SupervisorError::Io {
-                operation: "读取 sidecar 日志元数据",
-                source,
-            });
-        }
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(path).map_err(|source| SupervisorError::Io {
-        operation: "打开 sidecar 日志文件",
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        return platform::open_or_create_private_append(path).map_err(|source| {
             SupervisorError::Io {
-                operation: "收紧 sidecar 日志权限",
+                operation: "打开 sidecar 日志文件",
                 source,
             }
-        })?;
+        });
     }
-    Ok(file)
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or(SupervisorError::InvalidPathComponent)?;
+        ensure_host_owned_directory(parent).map_err(|source| SupervisorError::Io {
+            operation: "创建 sidecar 日志目录",
+            source,
+        })?;
+        set_private_directory_mode(parent).map_err(|source| SupervisorError::Io {
+            operation: "收紧 sidecar 日志目录权限",
+            source,
+        })?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(SupervisorError::Io {
+                    operation: "打开 sidecar 日志文件",
+                    source: io::Error::other("sidecar 日志路径必须是普通文件"),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(SupervisorError::Io {
+                    operation: "读取 sidecar 日志元数据",
+                    source,
+                });
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).map_err(|source| SupervisorError::Io {
+            operation: "打开 sidecar 日志文件",
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+                SupervisorError::Io {
+                    operation: "收紧 sidecar 日志权限",
+                    source,
+                }
+            })?;
+        }
+        Ok(file)
+    }
 }
 
 /// 返回当前编译目标的 sidecar 监督能力，供尚未持有 `Supervisor` 的调用方查询。
 pub fn capability() -> SupervisorCapability {
     #[cfg(windows)]
     {
+        // Windows 五项硬化 API 尚未在真实 runner 完成链接与运行验证，能力必须保持关闭。
         SupervisorCapability::Unavailable {
             reason: UnavailableReason::SidecarHardeningUnavailable,
         }
@@ -2477,6 +2524,21 @@ mod sidecar_log_tests {
     use std::io::Write;
     use std::path::Path;
 
+    /// Windows 测试目录使用仓库所在卷，避免系统临时目录的继承 ACL 阻断硬化 fixture。
+    fn log_tempdir() -> tempfile::TempDir {
+        #[cfg(windows)]
+        {
+            tempfile::Builder::new()
+                .prefix("efflab-agent-host-log-")
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .expect("必须能创建 Windows sidecar 日志测试目录")
+        }
+        #[cfg(not(windows))]
+        {
+            tempfile::tempdir().expect("必须能创建 sidecar 日志测试目录")
+        }
+    }
+
     /// 相对路径或含 `..` 的日志路径必须在打开前 fail-closed。
     #[test]
     fn sidecar_log_path_must_be_absolute_without_parent_dir() {
@@ -2499,7 +2561,7 @@ mod sidecar_log_tests {
     /// 独立日志文件必须可创建父目录，并在再次打开时追加而不是截断。
     #[test]
     fn sidecar_log_file_creates_parent_and_appends() {
-        let temporary = tempfile::tempdir().expect("必须能创建 sidecar 日志测试目录");
+        let temporary = log_tempdir();
         let root = fs::canonicalize(temporary.path()).expect("临时目录物理路径必须可解析");
         let path = root.join("nested").join("sidecar.log");
         {

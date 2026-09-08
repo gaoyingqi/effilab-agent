@@ -201,6 +201,26 @@ pub fn detach_std_command(cmd: &mut std::process::Command) {
     }
 }
 
+/// Configure a standard-library command for detached, suspended startup.
+///
+/// - Windows: preserves `CREATE_NO_WINDOW` and adds `CREATE_SUSPENDED`.
+/// - Non-Windows: exactly the same detachment behavior as [`detach_std_command`].
+///
+/// On Windows, pair this with [`ProcessGroup::attach_suspended_std`] immediately
+/// after `spawn()` so the child is in the Job Object before its first instruction.
+pub fn detach_std_command_suspended(cmd: &mut std::process::Command) {
+    #[cfg(not(windows))]
+    {
+        detach_std_command(cmd);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        cmd.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parent-death binding — Linux PR_SET_PDEATHSIG
 // ---------------------------------------------------------------------------
@@ -527,6 +547,26 @@ impl ProcessGroup {
         self.attach_pid(child.id())
     }
 
+    /// Attach a standard child before releasing its Windows suspended start.
+    ///
+    /// Windows first assigns the process to this Job Object and then resumes
+    /// its initial thread. If resuming fails, the process remains enrolled so
+    /// the caller can kill it and wait for it according to its own cleanup path.
+    /// On non-Windows platforms, this is the ordinary [`Self::attach_std`]
+    /// operation because there is no matching suspended-start contract.
+    pub fn attach_suspended_std(&mut self, child: &std::process::Child) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            // 先完成 Job 绑定，再恢复初始线程，消除子进程脱离 Job 的启动窗口。
+            self.attach_pid(child.id())?;
+            resume_suspended_main_thread(child.id())
+        }
+        #[cfg(not(windows))]
+        {
+            self.attach_std(child)
+        }
+    }
+
     /// Attach an already-spawned process by raw PID. The process must be (or
     /// lead) its own group/job — e.g. spawned via [`new_process_group`] (Unix
     /// `setpgid`) or a `detach_*` helper (Unix `setsid`) — otherwise `kill`
@@ -648,6 +688,73 @@ impl ProcessGroup {
         unsafe { TerminateJobObject(self.job, exit_code) }
             .map_err(|e| io::Error::other(format!("TerminateJobObject: {e}")))
     }
+}
+
+#[cfg(windows)]
+struct WindowsHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        // 快照和线程句柄统一在所有返回路径关闭，避免内核句柄泄漏。
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_main_thread(pid: u32) -> io::Result<()> {
+    use std::mem::size_of;
+    use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    use windows::core::HRESULT;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+        .map_err(|e| io::Error::other(format!("CreateToolhelp32Snapshot: {e}")))?;
+    let _snapshot_guard = WindowsHandle(snapshot);
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+
+    unsafe { Thread32First(snapshot, &mut entry) }
+        .map_err(|e| io::Error::other(format!("Thread32First: {e}")))?;
+
+    loop {
+        if entry.th32OwnerProcessID == pid {
+            // 挂起启动时目标进程应只有初始线程，只按 PID 匹配避免误恢复其它进程。
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+                .map_err(|e| {
+                    io::Error::other(format!("OpenThread({}): {e}", entry.th32ThreadID))
+                })?;
+            let _thread_guard = WindowsHandle(thread);
+            let previous_suspend_count = unsafe { ResumeThread(thread) };
+            if previous_suspend_count == u32::MAX {
+                let error = unsafe { GetLastError() };
+                return Err(io::Error::from_raw_os_error(error.0 as i32));
+            }
+            if previous_suspend_count != 1 {
+                return Err(io::Error::other(format!(
+                    "ResumeThread({}) returned unexpected suspend count {}",
+                    entry.th32ThreadID, previous_suspend_count
+                )));
+            }
+            return Ok(());
+        }
+
+        match unsafe { Thread32Next(snapshot, &mut entry) } {
+            Ok(()) => {}
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => break,
+            Err(e) => return Err(io::Error::other(format!("Thread32Next: {e}"))),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no initial thread found for suspended process {pid}"),
+    ))
 }
 
 #[cfg(windows)]
@@ -864,7 +971,7 @@ pub fn dup_tui_stderr() -> io::Result<std::fs::File> {
         // `DuplicateHandle` — avoiding the `from_raw_handle` footgun
         // where `File` would take ownership of the process stderr handle
         // and close it on drop.
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use std::os::windows::io::FromRawHandle;
         let stderr_handle = unsafe {
             windows::Win32::System::Console::GetStdHandle(
                 windows::Win32::System::Console::STD_ERROR_HANDLE,
@@ -1002,6 +1109,12 @@ mod tests {
     fn detach_std_command_does_not_panic() {
         let mut cmd = std::process::Command::new("echo");
         detach_std_command(&mut cmd);
+    }
+
+    #[test]
+    fn detach_std_command_suspended_does_not_panic() {
+        let mut cmd = std::process::Command::new("echo");
+        detach_std_command_suspended(&mut cmd);
     }
 
     #[test]
@@ -1436,6 +1549,43 @@ mod tests {
             stat_fd2.st_ino, stat_after.st_ino,
             "fd 2 inode should differ after restore (no longer /dev/null)"
         );
+    }
+
+    #[cfg(windows)]
+    const SUSPENDED_CHILD_TEST_ENV: &str = "__XAI_TTY_UTILS_SUSPENDED_CHILD_TEST";
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_suspended_child_probe() {
+        if std::env::var_os(SUSPENDED_CHILD_TEST_ENV).is_none() {
+            return;
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_group_attach_suspended_std_resumes_child() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut cmd = std::process::Command::new(executable);
+        cmd.args([
+            "--exact",
+            "tests::windows_suspended_child_probe",
+            "--nocapture",
+        ])
+        .env(SUSPENDED_CHILD_TEST_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        detach_std_command_suspended(&mut cmd);
+
+        let mut group = ProcessGroup::new().expect("create ProcessGroup");
+        #[allow(clippy::disallowed_methods)] // test: exercises suspended std spawn directly
+        let mut child = cmd.spawn().expect("spawn suspended test child");
+        group
+            .attach_suspended_std(&child)
+            .expect("attach and resume suspended child");
+        let status = child.wait().expect("wait resumed child");
+        assert!(status.success(), "resumed child failed: {status:?}");
     }
 
     #[tokio::test]

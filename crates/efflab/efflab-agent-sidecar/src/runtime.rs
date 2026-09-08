@@ -222,12 +222,23 @@ impl AsyncWrite for LoggingStdout {
 }
 
 /// 在 current-thread `LocalSet` 中运行最小 ACP agent，直到 stdio EOF 或 I/O 失败。
-pub async fn run_acp(sidecar: SidecarConfig) -> Result<()> {
+pub async fn run_acp(
+    sidecar: SidecarConfig,
+    startup_handles: crate::hardening::StartupHandles,
+) -> Result<()> {
     observability::runtime_started();
     let transport_state = AcpTransportState::new();
 
     // v1 repository 与模型 client 只从已校验的 SidecarConfig 构造；失败不回显配置正文。
-    let repository = SessionRepository::new(sidecar.home.clone());
+    #[cfg(windows)]
+    let repository =
+        SessionRepository::new_with_startup_handles(sidecar.home.clone(), startup_handles)
+            .map_err(|_| anyhow::anyhow!("sidecar session repository unavailable"))?;
+    #[cfg(not(windows))]
+    let repository = {
+        let _ = startup_handles;
+        SessionRepository::new(sidecar.home.clone())
+    };
     let model = HttpModelClient::from_runtime_config(&sidecar.runtime_config)
         .map_err(|_| anyhow::anyhow!("sidecar model client unavailable"))?;
     // MCP handshake 在 ACP dispatcher 创建前完成，避免未 ready 的 server 被错误广告；

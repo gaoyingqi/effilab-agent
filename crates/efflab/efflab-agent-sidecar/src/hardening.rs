@@ -7,14 +7,14 @@ use std::env;
 use std::ffi::OsString;
 use std::path::Path;
 
+#[cfg(windows)]
+use efflab_agent_platform as platform;
+
 use anyhow::{Context, Result, bail};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use fs2::FileExt;
 #[cfg(unix)]
 use std::ffi::CString;
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(not(unix))]
 use std::fs::File;
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -37,67 +37,78 @@ const L3B_BIND_ENV: &str = "EFFLAB_L3B_BIND";
 /// RuntimeConfigV1 的固定读取上限，防止启动阶段无界分配。
 pub const MAX_RUNTIME_CONFIG_BYTES: usize = 64 * 1024;
 
-/// Windows/非 Unix capability 尚未 proven；在所有文件读取和 env 清理前执行。
-#[cfg(unix)]
+/// Windows 与 Unix 都必须先通过共享的文件系统硬化边界。
 pub fn ensure_platform_supported() -> Result<()> {
-    Ok(())
-}
-
-/// 非 Unix 不允许直接拉起 sidecar，避免把未证明的权限模型当作安全边界。
-#[cfg(not(unix))]
-pub fn ensure_platform_supported() -> Result<()> {
-    bail!("sidecar_hardening_unavailable: Windows/非 Unix capability 尚未 proven")
+    #[cfg(windows)]
+    {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!("sidecar_hardening_unavailable: 当前平台没有已验证的文件系统能力")
+    }
 }
 
 /// 保存启动阶段已经 no-follow 校验过的 home 与 session 目录句柄。
 ///
 /// 主入口必须在配置校验后继续使用这组句柄，避免按同名路径重新解析到被替换的目录。
-#[cfg(unix)]
 pub struct StartupHandles {
+    #[cfg(unix)]
     home_directory: File,
+    #[cfg(unix)]
     session_cwd_directory: File,
+    #[cfg(windows)]
+    platform: platform::StartupHandles,
 }
 
-/// 非 Unix 不暴露任何可用的启动句柄。
-#[cfg(not(unix))]
-pub struct StartupHandles;
-
-/// 为一次启动打开并保存 home/session 目录 fd；runtime config 后续从 home fd 读取。
-#[cfg(unix)]
+/// 为一次启动打开并保存 home/session 目录句柄；runtime config 后续从 home fd 读取。
 pub fn open_startup_handles(home: &Path, session_cwd: &Path) -> Result<StartupHandles> {
-    let session_cwd_directory = match open_existing_private_directory(session_cwd, "--session-cwd")
+    #[cfg(windows)]
     {
-        Ok(directory) => directory,
-        Err(error) => {
-            tracing::debug!(
-                event = "session_fd_open_failed",
-                "打开 session 目录句柄失败"
-            );
-            return Err(error);
-        }
-    };
-    let home_directory = match open_existing_private_home_directory(home) {
-        Ok(directory) => directory,
-        Err(error) => {
-            tracing::debug!(event = "home_fd_open_failed", "打开 home 目录句柄失败");
-            return Err(error);
-        }
-    };
-    tracing::debug!(
-        event = "startup_fds_opened",
-        "启动 home 与 session 目录句柄已打开"
-    );
-    Ok(StartupHandles {
-        home_directory,
-        session_cwd_directory,
-    })
-}
-
-/// 非 Unix 在创建任何启动句柄前 fail-closed。
-#[cfg(not(unix))]
-pub fn open_startup_handles(_home: &Path, _session_cwd: &Path) -> Result<StartupHandles> {
-    ensure_platform_supported()?;
-    bail!("sidecar_hardening_unavailable")
+        return Ok(StartupHandles {
+            platform: platform::open_startup_handles(home, session_cwd)
+                .context("打开 Windows 启动目录句柄失败")?,
+        });
+    }
+    #[cfg(unix)]
+    {
+        let session_cwd_directory =
+            match open_existing_private_directory(session_cwd, "--session-cwd") {
+                Ok(directory) => directory,
+                Err(error) => {
+                    tracing::debug!(
+                        event = "session_fd_open_failed",
+                        "打开 session 目录句柄失败"
+                    );
+                    return Err(error);
+                }
+            };
+        let home_directory = match open_existing_private_home_directory(home) {
+            Ok(directory) => directory,
+            Err(error) => {
+                tracing::debug!(event = "home_fd_open_failed", "打开 home 目录句柄失败");
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            event = "startup_fds_opened",
+            "启动 home 与 session 目录句柄已打开"
+        );
+        return Ok(StartupHandles {
+            home_directory,
+            session_cwd_directory,
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (home, session_cwd);
+        ensure_platform_supported()?;
+        unreachable!()
+    }
 }
 
 #[cfg(unix)]
@@ -178,27 +189,75 @@ impl StartupHandles {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl StartupHandles {
-    /// 非 Unix 不读取 runtime config。
+    /// 从已钉住的 home 目录句柄读取固定 runtime config。
+    pub fn read_private_runtime_config(&self, path: &Path) -> Result<String> {
+        require_absolute_path(path, "--runtime-config")?;
+        if path.file_name() != Some(std::ffi::OsStr::new("runtime-config.v1.toml")) {
+            bail!("--runtime-config 必须指向 runtime-config.v1.toml");
+        }
+        let bytes = self
+            .platform
+            .read_private_file(
+                std::ffi::OsStr::new("runtime-config.v1.toml"),
+                MAX_RUNTIME_CONFIG_BYTES,
+            )
+            .context("从受保护 home 读取 runtime config 失败")?;
+        String::from_utf8(bytes).context("读取 RuntimeConfigV1 TOML 失败")
+    }
+
+    /// 只检查已钉住 home 下的旧配置目录项。
+    pub fn legacy_config_present(&self) -> Result<bool> {
+        self.platform
+            .path_entry_exists(std::ffi::OsStr::new("config.toml"))
+            .context("检查旧 config.toml 失败")
+    }
+
+    /// 在已钉住 home 下创建并锁定生命周期文件。
+    pub fn acquire_home_lock(&self) -> Result<File> {
+        let lock_file = self
+            .platform
+            .open_or_create_private_lock()
+            .context("打开 Windows home 锁失败")?;
+        FileExt::try_lock_exclusive(&lock_file)
+            .context("拒绝并发启动：私有 home 已被另一 sidecar 占用")?;
+        Ok(lock_file)
+    }
+
+    /// 用已钉住的 session cwd 句柄切换当前目录。
+    pub fn set_current_dir_secure(&self) -> Result<()> {
+        self.platform
+            .set_current_dir_secure()
+            .context("切换 --session-cwd 失败")
+    }
+
+    /// 克隆已钉住的 home 句柄，供 session repository 跨异步任务持有。
+    pub fn home_directory(&self) -> Result<platform::SecureDirectory> {
+        self.platform
+            .home_directory()
+            .context("克隆 Windows home 目录句柄失败")
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+impl StartupHandles {
+    /// 未实现平台不读取 runtime config。
     pub fn read_private_runtime_config(&self, _path: &Path) -> Result<String> {
         ensure_platform_supported()?;
         bail!("sidecar_hardening_unavailable")
     }
-
-    /// 非 Unix 不检查旧配置。
+    /// 未实现平台不检查旧配置。
     pub fn legacy_config_present(&self) -> Result<bool> {
         ensure_platform_supported()?;
         bail!("sidecar_hardening_unavailable")
     }
-
-    /// 非 Unix 不获取 home 锁。
+    /// 未实现平台不获取 home 锁。
     pub fn acquire_home_lock(&self) -> Result<File> {
         ensure_platform_supported()?;
         bail!("sidecar_hardening_unavailable")
     }
-
-    /// 非 Unix 不切换 sidecar cwd。
+    /// 未实现平台不切换当前目录。
     pub fn set_current_dir_secure(&self) -> Result<()> {
         ensure_platform_supported()
     }
@@ -225,8 +284,13 @@ pub fn prepare_private_home(home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 非 Unix 不创建任何 sidecar 文件系统状态。
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn prepare_private_home(home: &Path) -> Result<()> {
+    platform::ensure_private_directory(home).context("创建 Windows 私有 home 失败")?;
+    platform::verify_private_directory(home).context("验证 Windows 私有 home 失败")
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub fn prepare_private_home(_home: &Path) -> Result<()> {
     ensure_platform_supported()
 }
@@ -241,8 +305,16 @@ pub fn acquire_home_lock(home: &Path) -> Result<File> {
     Ok(lock_file)
 }
 
-/// 非 Unix 不打开或创建锁文件。
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn acquire_home_lock(home: &Path) -> Result<File> {
+    let lock_file =
+        platform::open_or_create_private_lock(home).context("打开 Windows home 锁失败")?;
+    FileExt::try_lock_exclusive(&lock_file)
+        .context("拒绝并发启动：私有 home 已被另一 sidecar 占用")?;
+    Ok(lock_file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub fn acquire_home_lock(_home: &Path) -> Result<File> {
     ensure_platform_supported()?;
     bail!("sidecar_hardening_unavailable")
@@ -299,8 +371,20 @@ fn read_private_runtime_config_at(parent: &File, filename: &std::ffi::OsStr) -> 
     Ok(source)
 }
 
-/// 非 Unix 在 capability 关闭期间不读取 runtime config。
-#[cfg(not(unix))]
+/// Windows 通过共享平台原语读取受保护的 runtime config。
+#[cfg(windows)]
+pub fn read_private_runtime_config(path: &Path) -> Result<String> {
+    require_absolute_path(path, "--runtime-config")?;
+    if path.file_name() != Some(std::ffi::OsStr::new("runtime-config.v1.toml")) {
+        bail!("--runtime-config 必须指向 runtime-config.v1.toml");
+    }
+    let bytes = platform::read_private_file(path, MAX_RUNTIME_CONFIG_BYTES)
+        .context("读取 RuntimeConfigV1 TOML 失败")?;
+    String::from_utf8(bytes).context("读取 RuntimeConfigV1 TOML 失败")
+}
+
+/// 未实现平台在 capability 关闭期间不读取 runtime config。
+#[cfg(all(not(unix), not(windows)))]
 pub fn read_private_runtime_config(_path: &Path) -> Result<String> {
     ensure_platform_supported()?;
     bail!("sidecar_hardening_unavailable")
@@ -340,8 +424,13 @@ pub fn set_current_dir_secure(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 非 Unix 不切换 sidecar cwd。
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn set_current_dir_secure(path: &Path) -> Result<()> {
+    platform::set_current_dir_secure(path).context("切换 --session-cwd 失败")
+}
+
+/// 未实现平台不切换 sidecar cwd。
+#[cfg(all(not(unix), not(windows)))]
 pub fn set_current_dir_secure(_path: &Path) -> Result<()> {
     ensure_platform_supported()
 }
@@ -354,6 +443,17 @@ pub fn path_entry_exists(path: &Path) -> Result<bool> {
     let parent_directory = open_existing_directory(parent, "路径父目录")?;
     let filename = path.file_name().context("路径必须包含目录项")?;
     path_entry_exists_at(&parent_directory, filename, "路径")
+}
+
+#[cfg(windows)]
+pub fn path_entry_exists(path: &Path) -> Result<bool> {
+    platform::path_entry_exists(path).context("检查路径目录项失败")
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub fn path_entry_exists(_path: &Path) -> Result<bool> {
+    ensure_platform_supported()?;
+    bail!("sidecar_hardening_unavailable")
 }
 
 #[cfg(unix)]
@@ -384,14 +484,7 @@ fn path_entry_exists_at(
     }
 }
 
-/// 非 Unix 不检查 sidecar 文件系统目录项。
-#[cfg(not(unix))]
-pub fn path_entry_exists(_path: &Path) -> Result<bool> {
-    ensure_platform_supported()?;
-    bail!("sidecar_hardening_unavailable")
-}
-
-/// 在同一父目录中原子替换私有文件，并在 Unix 上固定为 owner-only `0600`。
+/// 其它平台不检查 sidecar 文件系统目录项。/// 在同一父目录中原子替换私有文件，并在 Unix 上固定为 owner-only `0600`。
 ///
 /// Task 12 当前只读 Host 的 runtime config；该通用 helper 为后续 session journal 保留
 /// 同目录临时文件、文件同步、rename 和父目录同步的安全写入语义。
@@ -499,8 +592,12 @@ fn create_private_temp_file(parent: &File, description: &str) -> Result<PrivateT
     bail!("无法为 {description} 原子写临时文件分配唯一名称")
 }
 
-/// 非 Unix 不执行私有文件原子写。
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn atomic_write_private(path: &Path, content: &[u8]) -> Result<()> {
+    platform::atomic_write_private(path, content).context("原子写私有文件失败")
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub fn atomic_write_private(_path: &Path, _content: &[u8]) -> Result<()> {
     ensure_platform_supported()
 }
@@ -968,17 +1065,23 @@ mod tests {
     use std::collections::BTreeSet;
     use std::env;
     use std::ffi::OsString;
+    #[cfg(unix)]
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use super::*;
 
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(unix)]
     static CURRENT_DIRECTORY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(unix)]
     struct CurrentDirectoryRestore(PathBuf);
 
+    #[cfg(unix)]
     impl Drop for CurrentDirectoryRestore {
         fn drop(&mut self) {
             let _ = env::set_current_dir(&self.0);

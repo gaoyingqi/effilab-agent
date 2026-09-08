@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 # Host 与 sidecar 仅通过无 grok runtime 的共享契约交换版本化 DTO。
 efflab-agent-contract = { path = "../efflab-agent-contract" }
+efflab-agent-platform = { path = "../efflab-agent-platform" }
 # ACP 类型与 gateway 是后续最小 runtime 的直接协议边界；unstable 是 xai-acp-lib 的既定要求。
 agent-client-protocol = { workspace = true, features = ["unstable"] }
 async-trait = { workspace = true }

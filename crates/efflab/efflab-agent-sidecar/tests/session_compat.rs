@@ -7,7 +7,9 @@ use efflab_agent_sidecar::session_store::{
     MAX_JSON_DEPTH, MAX_LINE_BYTES, MAX_RECORDS, MAX_SESSION_FILE_BYTES, SessionError,
     SessionRecord, SessionRepository,
 };
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
+#[cfg(not(windows))]
+use tempfile::tempdir;
 
 struct TestStore {
     _temporary: TempDir,
@@ -16,14 +18,25 @@ struct TestStore {
 }
 
 fn test_store() -> TestStore {
+    #[cfg(windows)]
+    let temporary = tempfile::Builder::new()
+        .prefix("efflab-agent-session-compat-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .expect("创建 Windows session store 测试目录");
+    #[cfg(not(windows))]
     let temporary = tempdir().expect("创建 session store 测试目录");
     let home = temporary.path().join("home");
-    std::fs::create_dir(&home).expect("创建 session store home");
-    #[cfg(unix)]
+    #[cfg(windows)]
+    efflab_agent_platform::ensure_private_directory(&home).expect("创建 Windows 私有 session home");
+    #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-            .expect("设置 session store home 私有权限");
+        std::fs::create_dir(&home).expect("创建 session store home");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                .expect("设置 session store home 私有权限");
+        }
     }
     let repository = SessionRepository::new(home.clone());
     TestStore {
@@ -511,7 +524,10 @@ async fn compact_summary_round_trips_without_rewriting_earlier_records() {
     let test = test_store();
     let session = test.repository.create_with_id("compact").await.unwrap();
     test.repository
-        .append(&session.id, &[user_record("p1", 0), assistant_record("p1", 1)])
+        .append(
+            &session.id,
+            &[user_record("p1", 0), assistant_record("p1", 1)],
+        )
         .await
         .unwrap();
     test.repository
