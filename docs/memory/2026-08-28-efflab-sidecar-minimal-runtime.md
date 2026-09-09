@@ -45,11 +45,11 @@
 ## 未验证项与平台边界
 
 - `x86_64-apple-darwin` 和 `x86_64-pc-windows-msvc` 的真实 release binary build/strings certification 未执行；当前 arm64 结果不能外推。
-- 没有 Windows runner/真机，`pr0_windows_hardening` 只保留非 Windows unproven 记录；Windows capability 不得改为 Available。
+- Windows runner 已完成 `pr0_windows_hardening` 与 sidecar ACP 定向验证；当前 Host capability 已开放。产品发布版 smoke、签名、MSIX、真实商店安装和真实 BYOK 仍需分别记录。
 - 没有 matched Host + sidecar + Web/lock/hash tuple；产品仓仍保持 S0 expected-rev，不能声称 S4。
 - Host 的 Unix fake sidecar 测试不等于真实 Windows sidecar、真实 Web/Tauri 联动或发布包 smoke；真实产品 Tauri/MSIX bundle 仍未验证。
 
 ## 保护项与回滚
 
 - 不删除、不修改、不移动 `crates/efflab/efflab-pr0-http-probe/`；`scripts/fork-sync-apply.sh --check` 继续验证它不在生成的 workspace member 列表中。
-- ACP/sidecar 回滚必须与对应 Host contract 一起回滚；MCP 出现异常时退回空 `ApprovedMcpSpecV1` 并重启 scope；Windows 始终保持 unavailable。
+- ACP/sidecar 回滚必须与对应 Host contract 一起回滚；MCP 出现异常时退回空 `ApprovedMcpSpecV1` 并重启 scope；若产品 Windows release smoke 失败，恢复 Host capability unavailable 分支并同步回滚回归断言。

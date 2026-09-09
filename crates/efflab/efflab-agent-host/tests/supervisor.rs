@@ -1175,8 +1175,7 @@ fn windows_rejects_drive_relative_app_id_and_scope() {
     assert!(matches!(scope_error, SupervisorError::InvalidPathComponent));
 }
 
-/// Windows 上无 Channel 与硬化不可用同时出现时，优先报告 sidecar 不可用而非缺少 Key。
-/// 该断言只在 Windows CI 运行；非 Windows 目标不编译此平台能力分支。
+/// Windows 上无 Channel 时报告通道配置错误；该断言只在 Windows CI 运行。
 #[cfg(windows)]
 struct WindowsUnconfiguredApp;
 
@@ -1230,44 +1229,35 @@ impl efflab_agent_host::KitEventSink for DiscardWindowsSink {
 
 #[cfg(windows)]
 #[test]
-fn windows_unconfigured_capability_prefers_sidecar_unavailable() {
+fn windows_unconfigured_capability_reports_channel_configuration_error() {
     use efflab_agent_host::{HostRuntime, KitCommand};
 
     let root = std::env::temp_dir().join("efflab-agent-host-windows-capability");
     let runtime = HostRuntime::new(WindowsUnconfiguredApp, DiscardWindowsSink, config(root));
     let error = runtime
         .dispatch(KitCommand::GetCapability)
-        .expect_err("Windows 硬化不可用必须优先于无 Channel 返回");
+        .expect_err("Windows capability 可用时未配置 Channel 必须报告配置错误");
 
-    assert_eq!(error.code, "sidecar_unavailable");
-    assert!(error.retryable, "平台硬化不可用必须可重试");
+    assert_eq!(error.code, "llm_channel_unconfigured");
 }
 
-/// Windows 必须保留 Supervisor、lifecycle 和 kill API 的编译形状，同时 fail-closed。
+/// Windows 必须保留 Supervisor、scope slot 和 kill API 的编译形状，并允许进入启动前阶段。
 #[cfg(windows)]
 #[test]
-fn windows_reports_unavailable_and_keeps_kill_api_compilable() {
-    use efflab_agent_host::{SupervisorCapability, UnavailableReason};
+fn windows_reports_available_and_keeps_kill_api_compilable() {
+    use efflab_agent_host::SupervisorCapability;
 
     let root = std::env::temp_dir().join("efflab-agent-host-windows-supervisor");
     let supervisor = Supervisor::new(config(root), "windows-app")
         .expect("绝对 Windows 临时目录必须可构造 supervisor");
-    assert_eq!(
-        supervisor.capability(),
-        SupervisorCapability::Unavailable {
-            reason: UnavailableReason::SidecarHardeningUnavailable,
-        }
-    );
-    let error = supervisor
+    assert_eq!(supervisor.capability(), SupervisorCapability::Available);
+    let slot = supervisor
         .acquire("scope")
-        .err()
-        .expect("Windows supervisor 不得 spawn 或取得 scope slot");
-    assert!(matches!(
-        error,
-        SupervisorError::Unavailable {
-            reason: UnavailableReason::SidecarHardeningUnavailable
-        }
-    ));
+        .expect("Windows supervisor 必须允许取得 scope slot");
+    assert_eq!(
+        slot.paths().workspace.file_name().and_then(|name| name.to_str()),
+        Some("workspace")
+    );
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let child = RecordingChild {

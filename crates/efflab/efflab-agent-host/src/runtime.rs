@@ -256,9 +256,9 @@ impl HostRuntime {
         }
     }
 
-    /// GetCapability 只读本地 committed view；平台硬化不可用优先于无 Channel 返回。
+    /// GetCapability 只读本地 committed view；平台 capability 不可用优先于无 Channel 返回。
     fn dispatch_get_capability(&self) -> Result<KitReply, KitError> {
-        // 先读取平台能力：Windows 这类硬化不可用的目标不能被 no-key 语义掩盖。
+        // 先读取平台能力：硬化不可用的目标不能被 no-key 语义掩盖。
         let supervisor_capability = capability();
         let channel = self.channel_service()?.view().map_err(channel_error)?;
         if channel.kind.is_none() {

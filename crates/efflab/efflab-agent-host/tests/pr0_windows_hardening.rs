@@ -17,12 +17,10 @@ fn unix_sidecar_capability_is_available_and_records_windows_gap() {
 
 #[cfg(windows)]
 #[test]
-fn windows_sidecar_capability_is_unavailable_fail_closed() {
+fn windows_sidecar_capability_is_available_after_hardening() {
     assert_eq!(
         efflab_agent_host::capability(),
-        efflab_agent_host::SupervisorCapability::Unavailable {
-            reason: efflab_agent_host::UnavailableReason::SidecarHardeningUnavailable,
-        }
+        efflab_agent_host::SupervisorCapability::Available
     );
 }
 

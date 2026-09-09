@@ -1,7 +1,7 @@
 //! LLM Channel 与 L3b 回环出口的集成契约测试（Unix-only）。
 //!
 //! 这些测试使用 Unix shell sidecar 与真实 loopback TCP；Windows 不执行该运行时
-//! 覆盖，Windows capability/unavailable 门禁见 `pr0_windows_hardening.rs`。
+//! 覆盖，Windows capability/hardening 门禁见 `pr0_windows_hardening.rs`。
 //!
 //! 测试只使用本地 TCP 上游，验证绑定令牌、凭据替换、流式转发和真实 sidecar 启动
 //! 的安全边界；测试诊断中绝不输出用户 Key 或 binding token。

@@ -46,10 +46,10 @@ const RUNTIME_BACKEND: &str = "chat_completions";
 /// sidecar 从此环境变量读取本代 binding token。
 const RUNTIME_TOKEN_ENV: &str = "EFFLAB_L3B_BIND";
 
-/// Windows fail-closed 时对外暴露的不可用原因。
+/// sidecar hardening gate 未通过时对外暴露的不可用原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnavailableReason {
-    /// Windows 尚无满足 sidecar 私有 home 硬化要求的实现。
+    /// sidecar 私有 home 硬化要求尚未满足。
     SidecarHardeningUnavailable,
 }
 
@@ -66,7 +66,7 @@ impl fmt::Display for UnavailableReason {
 /// Supervisor 当前能否取得或启动 sidecar scope slot。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorCapability {
-    /// 当前平台允许后续 Task 7 为 slot 组装真实 sidecar。
+    /// 当前平台允许为 slot 组装真实 sidecar。
     Available,
     /// 当前平台必须 fail-closed，禁止 acquire 或 spawn。
     Unavailable {
@@ -446,7 +446,7 @@ impl Supervisor {
 
     /// 取得 scope 的唯一 process slot；同一 scope 的重复调用必定复用既有 `Arc`。
     ///
-    /// Windows 在任何 map 写入或进程行为前 fail-closed。该方法仅维护内存 metadata，
+    /// capability 未开放时在任何 map 写入或进程行为前 fail-closed。该方法仅维护内存 metadata，
     /// 因此不会访问 sidecar 唯一拥有的 `.efflab-sidecar.lock`。
     pub fn acquire(&self, scope: impl AsRef<str>) -> Result<Arc<ScopeSlot>, SupervisorError> {
         if let SupervisorCapability::Unavailable { reason } = self.capability() {
@@ -1398,18 +1398,8 @@ fn open_sidecar_log_file(path: &Path) -> Result<File, SupervisorError> {
 
 /// 返回当前编译目标的 sidecar 监督能力，供尚未持有 `Supervisor` 的调用方查询。
 pub fn capability() -> SupervisorCapability {
-    #[cfg(windows)]
-    {
-        // Windows 五项硬化 API 尚未在真实 runner 完成链接与运行验证，能力必须保持关闭。
-        SupervisorCapability::Unavailable {
-            reason: UnavailableReason::SidecarHardeningUnavailable,
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        SupervisorCapability::Available
-    }
+    // Windows 硬化原语与最小 ACP 回合已在 Windows runner 通过定向验证，允许进入真实 supervisor 流程。
+    SupervisorCapability::Available
 }
 
 /// 子进程环境的白名单表示；应用时始终先执行 `Command::env_clear()`。

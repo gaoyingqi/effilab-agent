@@ -214,7 +214,7 @@ RuntimeConfigV1 字段为闭集（`deny_unknown_fields`）：
 ## 6. 生命周期
 
 - 关闭：Host 关闭 stdin → sidecar 约 3.5s 内退出（码 0）。
-- 测试平台边界：使用 FIFO/Unix shell fake sidecar 的 stdio 集成测试明确为 Unix-only；当前 Windows 只验证 capability=unavailable 与 Windows API 编译单元，不把 Unix 运行结果表述为 Windows fake sidecar 通过。
+- 测试平台边界：使用 FIFO/Unix shell fake sidecar 的 stdio 集成测试明确为 Unix-only；Windows 已验证 capability=available、Windows 硬化 API 与最小 ACP 回合，但不把 Unix fake sidecar 的运行结果外推为 Windows 全量运行时覆盖。
 - 超时兜底：TERM → 2s → KILL（Windows 对等 API 必须存在：Job Object + `TerminateProcess`）。
 - 退出码：正常 EOF=`0`、启动策略拒绝=`2`、runtime 错误=`1`。
 - in-flight `session/prompt` 时禁止 idle-kill；先发 `session/cancel` 通知，再关 stdin。

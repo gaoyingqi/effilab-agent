@@ -1,7 +1,7 @@
 //! HostRuntime dispatch 闭环的真实 stdio 集成测试（Unix-only）。
 //!
 //! 每个用例都启动临时 shell sidecar，通过真实 stdin/stdout 收发 JSON-RPC；测试
-//! 依赖 Unix shell/FIFO，Windows 不执行；Windows capability/unavailable 门禁见
+//! 依赖 Unix shell/FIFO，Windows 不执行；Windows capability/hardening 门禁见
 //! `pr0_windows_hardening.rs`。
 //! 只观察非敏感 wire 和 Kit 产品事件，避免 mock 掩盖进程、握手与反向 RPC 接线。
 

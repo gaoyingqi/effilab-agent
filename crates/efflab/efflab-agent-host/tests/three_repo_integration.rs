@@ -1,7 +1,7 @@
 //! Task24 的最小三仓边界测试（Unix-only）。
 //!
 //! 该文件依赖 Unix FIFO 与 shell fake sidecar；Windows 不执行这些运行时测试，
-//! Windows 的 capability/unavailable 门禁见 `pr0_windows_hardening.rs`。
+//! Windows 的 capability/hardening 门禁见 `pr0_windows_hardening.rs`。
 //! 该文件只通过 HostRuntime 的公开 Kit 入口和 ACP stdio wire 观察契约；Web/Tauri
 //! 的行为由各自仓库的分层测试验证，不在 Rust 中伪造执行。MCP 用例在 Host
 //! catalog wire 处收口，真实 HTTP MCP transport 仍由 sidecar 分层测试负责。
