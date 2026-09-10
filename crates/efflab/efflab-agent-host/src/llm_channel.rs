@@ -107,13 +107,29 @@ pub enum LlmChannelError {
     StaleChannelRevision,
     /// Channel 内部并发状态不可用。
     StateUnavailable,
-    /// sidecar 批量 restart 失败；新的 committed view 仍然有效，可重试。
+    /// sidecar 批量 restart 失败；新的 committed view 仍然有效，需重启应用。
     RestartFailed,
-    /// L3b 监听或进程启动失败；新的 committed view 仍然有效，可重试。
+    /// L3b 监听或进程启动失败；新的 committed view 仍然有效，需重启应用。
     LifecycleFailed,
 }
 
 impl LlmChannelError {
+    /// 返回稳定的英文错误分类；日志不记录上游地址、秘密或底层错误文本。
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "llm_channel_unconfigured",
+            Self::InvalidRequest => "invalid_request",
+            Self::RelayNotImplemented => "relay_not_implemented",
+            Self::SealFailed => "seal_failed",
+            Self::PersistFailed => "persist_failed",
+            Self::UnsealFailed => "unseal_failed",
+            Self::StaleChannelRevision => "stale_channel_revision",
+            Self::StateUnavailable => "state_unavailable",
+            Self::RestartFailed => "restart_failed",
+            Self::LifecycleFailed => "lifecycle_failed",
+        }
+    }
+
     /// 将 Channel 失败转换为未来 runtime 可直接返还的结构化 KitError。
     pub fn as_kit_error(self) -> KitError {
         match self {
@@ -138,10 +154,10 @@ impl LlmChannelError {
             ),
             Self::RestartFailed | Self::LifecycleFailed => KitError {
                 code: "sidecar_unavailable".to_string(),
-                message: "LLM Channel 已保存，但 sidecar 重启失败，可重试".to_string(),
+                message: "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试".to_string(),
                 details: None,
                 request_id: None,
-                retryable: true,
+                retryable: false,
                 retry_after_ms: None,
             },
         }
@@ -168,6 +184,29 @@ impl fmt::Display for LlmChannelError {
 }
 
 impl std::error::Error for LlmChannelError {}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::LlmChannelError;
+
+    /// 验证 Windows 也会执行的重启失败协议：已提交配置不能被当作可自动重试错误。
+    #[test]
+    fn restart_failures_require_application_restart() {
+        for (error, code) in [
+            (LlmChannelError::RestartFailed, "restart_failed"),
+            (LlmChannelError::LifecycleFailed, "lifecycle_failed"),
+        ] {
+            let kit_error = error.as_kit_error();
+            assert_eq!(error.code(), code);
+            assert_eq!(kit_error.code, "sidecar_unavailable");
+            assert!(!kit_error.retryable);
+            assert_eq!(
+                kit_error.message,
+                "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试"
+            );
+        }
+    }
+}
 
 /// L3b 在认证 binding token 后临时取得的上游 Channel；秘密守卫不能 Debug/Clone。
 pub(crate) struct ResolvedUpstream {
@@ -814,12 +853,31 @@ impl LlmChannelService {
     {
         // 在公开构造边界保留具体产品类型的 Arc ergonomics，内部只持有领域 trait 对象。
         let app: Arc<dyn HostApp> = app;
-        let manager = Arc::new(LlmChannelManager::new(
-            Arc::clone(&app),
-            config.l3b.allow_loopback_llm,
-        )?);
-        let supervisor = Supervisor::new(config.clone(), app.app_id())
-            .map_err(map_supervisor_error_to_lifecycle)?;
+        log::info!("Agent Kit lifecycle stage=channel_manager_initialization started");
+        let manager = match LlmChannelManager::new(Arc::clone(&app), config.l3b.allow_loopback_llm)
+        {
+            Ok(manager) => {
+                log::info!("Agent Kit lifecycle stage=channel_manager_initialization completed");
+                Arc::new(manager)
+            }
+            Err(error) => {
+                log::error!(
+                    "Agent Kit lifecycle stage=channel_manager_initialization failed error_code={}",
+                    error.code()
+                );
+                return Err(error);
+            }
+        };
+        let supervisor = match Supervisor::new(config.clone(), app.app_id()) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                log::error!(
+                    "Agent Kit lifecycle stage=supervisor_initialization failed error_code={}",
+                    error.code()
+                );
+                return Err(map_supervisor_error_to_lifecycle(error));
+            }
+        };
         Ok(Self {
             manager,
             supervisor: Arc::new(supervisor),
@@ -873,20 +931,66 @@ impl LlmChannelService {
             .lifecycle_lock
             .lock()
             .map_err(|_| LlmChannelError::StateUnavailable)?;
-        let loopback = self.ensure_loopback()?;
-        let paths = self
-            .supervisor
-            .paths_for(scope)
-            .map_err(map_supervisor_error_to_lifecycle)?;
-        let info = self
-            .supervisor
-            .launch_sidecar(scope, &loopback, &self.manager, approved_mcp)
-            .map_err(map_supervisor_error_to_lifecycle)?;
-        let stdio = match self.supervisor.take_stdio(scope, info.generation) {
-            Ok(stdio) => stdio,
+        let loopback = match self.ensure_loopback() {
+            Ok(loopback) => loopback,
             Err(error) => {
+                log::error!(
+                    "Agent Kit lifecycle stage=l3b_loopback failed error_code={}",
+                    error.code()
+                );
+                return Err(error);
+            }
+        };
+        log::info!(
+            "Agent Kit lifecycle stage=l3b_loopback completed listen_port={}",
+            loopback.local_addr().port()
+        );
+        log::info!("Agent Kit lifecycle stage=paths_for started");
+        let paths = match self.supervisor.paths_for(scope) {
+            Ok(paths) => {
+                log::info!("Agent Kit lifecycle stage=paths_for completed");
+                paths
+            }
+            Err(error) => {
+                log::error!(
+                    "Agent Kit lifecycle stage=paths_for failed error_code={}",
+                    error.code()
+                );
+                return Err(map_supervisor_error_to_lifecycle(error));
+            }
+        };
+        let info =
+            match self
+                .supervisor
+                .launch_sidecar(scope, &loopback, &self.manager, approved_mcp)
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    log::error!(
+                        "Agent Kit lifecycle stage=sidecar_launch failed error_code={}",
+                        error.code()
+                    );
+                    return Err(map_supervisor_error_to_lifecycle(error));
+                }
+            };
+        log::info!("Agent Kit lifecycle stage=stdio_take started");
+        let stdio = match self.supervisor.take_stdio(scope, info.generation) {
+            Ok(stdio) => {
+                log::info!("Agent Kit lifecycle stage=stdio_take completed");
+                stdio
+            }
+            Err(error) => {
+                log::error!(
+                    "Agent Kit lifecycle stage=stdio_take failed error_code={}",
+                    error.code()
+                );
                 // 不能留下已经取得 binding token、但没有 IO actor 的 child。
-                let _ = self.supervisor.stop_scope(scope);
+                if let Err(cleanup_error) = self.supervisor.stop_scope(scope) {
+                    log::error!(
+                        "Agent Kit lifecycle stage=stdio_take_cleanup failed error_code={}",
+                        cleanup_error.code()
+                    );
+                }
                 return Err(map_supervisor_error_to_lifecycle(error));
             }
         };
@@ -983,7 +1087,10 @@ impl LlmChannelService {
                     .map_err(|_| SupervisorError::McpSpecUnavailable)
             })
             .map_err(|error| {
-                tracing::error!(error = %error, "sidecar 批量重启失败");
+                log::error!(
+                    "Agent Kit lifecycle stage=sidecar_restart failed error_code={}",
+                    error.code()
+                );
                 LlmChannelError::RestartFailed
             })?;
         Ok(change)
@@ -991,9 +1098,29 @@ impl LlmChannelService {
 
     /// 配置有效时延迟创建唯一进程级监听；监听地址严格由 L3bRuntimeConfig 约束。
     fn ensure_loopback(&self) -> Result<Arc<L3bLoopback>, LlmChannelError> {
+        log::info!("Agent Kit lifecycle stage=l3b_loopback started");
         // 对重启后加载的配置复核 URL 形状，再创建进程级 L3b listener。
-        self.manager.ensure_startable()?;
-        if !self.manager.has_active_byok()? {
+        if let Err(error) = self.manager.ensure_startable() {
+            log::error!(
+                "Agent Kit lifecycle stage=l3b_loopback failed error_code={}",
+                error.code()
+            );
+            return Err(error);
+        }
+        let has_active_byok = match self.manager.has_active_byok() {
+            Ok(active) => active,
+            Err(error) => {
+                log::error!(
+                    "Agent Kit lifecycle stage=l3b_loopback failed error_code={}",
+                    error.code()
+                );
+                return Err(error);
+            }
+        };
+        if !has_active_byok {
+            log::error!(
+                "Agent Kit lifecycle stage=l3b_loopback failed error_code=llm_channel_unconfigured"
+            );
             return Err(LlmChannelError::Unconfigured);
         }
         let mut current = self
@@ -1001,20 +1128,39 @@ impl LlmChannelService {
             .lock()
             .map_err(|_| LlmChannelError::StateUnavailable)?;
         if let Some(loopback) = current.as_ref() {
+            log::info!(
+                "Agent Kit lifecycle stage=l3b_loopback reused listen_port={}",
+                loopback.local_addr().port()
+            );
             return Ok(Arc::clone(loopback));
         }
         let loopback = Arc::new(
-            L3bLoopback::start(Arc::clone(&self.manager), self.l3b_config.clone())
-                .map_err(|_| LlmChannelError::LifecycleFailed)?,
+            match L3bLoopback::start(Arc::clone(&self.manager), self.l3b_config.clone()) {
+                Ok(loopback) => loopback,
+                Err(error) => {
+                    log::error!(
+                        "Agent Kit lifecycle stage=l3b_loopback failed error_code={}",
+                        error.code()
+                    );
+                    return Err(LlmChannelError::LifecycleFailed);
+                }
+            },
         );
         *current = Some(Arc::clone(&loopback));
+        log::info!(
+            "Agent Kit lifecycle stage=l3b_loopback completed listen_port={}",
+            loopback.local_addr().port()
+        );
         Ok(loopback)
     }
 }
 
 /// 不保留 Supervisor I/O 错误链，避免上层透传子进程环境或路径诊断。
 fn map_supervisor_error_to_lifecycle(error: SupervisorError) -> LlmChannelError {
-    tracing::error!(error = %error, "sidecar supervisor 失败");
+    log::error!(
+        "Agent Kit lifecycle stage=supervisor failed error_code={}",
+        error.code()
+    );
     match error {
         SupervisorError::StateUnavailable => LlmChannelError::StateUnavailable,
         _ => LlmChannelError::LifecycleFailed,

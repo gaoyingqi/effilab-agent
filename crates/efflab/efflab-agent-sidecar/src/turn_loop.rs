@@ -16,8 +16,7 @@ use xai_acp_lib::AcpGatewaySender;
 
 use crate::mcp_client::{McpCallResult, McpCancellationToken, McpError, McpRuntime};
 use crate::model_client::{
-    CancellationToken, DEBUG_PREVIEW_BYTES, HttpModelClient, ModelDelta, ModelError, ModelToolCall,
-    ModelTurnRequest, truncate_for_debug,
+    CancellationToken, HttpModelClient, ModelDelta, ModelError, ModelToolCall, ModelTurnRequest,
 };
 use crate::session_store::{
     MAX_RECORD_ID_BYTES, MAX_RECORD_LINE_BYTES, SessionError, SessionRecord, SessionRepository,
@@ -69,9 +68,10 @@ pub enum TurnLoopError {
     Permission,
 }
 
-impl fmt::Display for TurnLoopError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let code = match self {
+impl TurnLoopError {
+    /// 返回只包含固定字面量的回合错误码，供 ACP 错误映射和安全日志共用。
+    pub(crate) fn code(self) -> &'static str {
+        match self {
             Self::SessionNotFound => "turn_session_not_found",
             Self::Session => "turn_session_error",
             Self::ReadOnly => "turn_session_read_only",
@@ -79,8 +79,13 @@ impl fmt::Display for TurnLoopError {
             Self::Transport => "turn_transport_error",
             Self::ToolRejected => "turn_tool_rejected",
             Self::Permission => "turn_permission_error",
-        };
-        formatter.write_str(code)
+        }
+    }
+}
+
+impl fmt::Display for TurnLoopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
     }
 }
 
@@ -254,7 +259,6 @@ impl TurnLoop {
             event = "turn_started",
             prompt_id_bytes = prompt_id.len(),
             user_text_bytes = user_text.len(),
-            user_text = %truncate_for_debug(user_text, DEBUG_PREVIEW_BYTES),
             "sidecar turn loop 已进入 prompt"
         );
         let cancellation = control.cancellation();
@@ -337,9 +341,9 @@ impl TurnLoop {
                 Err(error) => {
                     tracing::debug!(
                         event = "turn_model_request_failed",
-                        error = %error,
+                        error_code = error.code(),
                         message_count = messages.len(),
-                        "模型 turn 请求失败"
+                        "Model turn request failed"
                     );
                     return self
                         .finish_failed(
@@ -445,13 +449,9 @@ impl TurnLoop {
                     Err(error) => {
                         tracing::debug!(
                             event = "turn_model_stream_failed",
-                            error = %error,
+                            error_code = error.code(),
                             assistant_text_bytes = assistant_text.len(),
-                            assistant_text = %truncate_for_debug(
-                                &assistant_text,
-                                DEBUG_PREVIEW_BYTES
-                            ),
-                            "模型 SSE stream 读取失败"
+                            "Model SSE stream failed"
                         );
                         return self
                             .finish_failed(
@@ -706,8 +706,8 @@ impl TurnLoop {
             Err(error) => {
                 tracing::debug!(
                     event = "turn_compact_failed",
-                    error = %error,
-                    "压缩模型请求失败，本轮继续使用完整上下文"
+                    error_code = error.code(),
+                    "Model compaction request failed; continuing with full context"
                 );
                 return CompactOutcome::Skipped;
             }
@@ -731,8 +731,8 @@ impl TurnLoop {
                 Err(error) => {
                     tracing::debug!(
                         event = "turn_compact_failed",
-                        error = %error,
-                        "压缩模型流失败，本轮继续使用完整上下文"
+                        error_code = error.code(),
+                        "Model compaction stream failed; continuing with full context"
                     );
                     return CompactOutcome::Skipped;
                 }
@@ -764,8 +764,8 @@ impl TurnLoop {
         {
             tracing::debug!(
                 event = "turn_compact_failed",
-                error = %error,
-                "压缩摘要落盘失败，本轮继续使用完整上下文"
+                error_code = error.code(),
+                "Persisting model compaction failed; continuing with full context"
             );
             return CompactOutcome::Skipped;
         }
@@ -778,8 +778,8 @@ impl TurnLoop {
             Err(error) => {
                 tracing::debug!(
                     event = "turn_compact_failed",
-                    error = %error,
-                    "压缩后重新加载失败，使用未盖章的内存摘要"
+                    error_code = error.code(),
+                    "Reload after model compaction failed; using in-memory summary"
                 );
                 records.push(record);
             }
@@ -2229,6 +2229,17 @@ mod tests {
                 message["content"] != "old user" && message["content"] != "old assistant"
             }),
             "被覆盖前缀不得进入模型上下文: {messages:?}"
+        );
+    }
+
+    /// 模型、压缩和持久化失败日志只能记录稳定错误码，不能回显错误值。
+    #[test]
+    fn failure_logs_use_stable_error_codes_without_error_values() {
+        let source = include_str!("turn_loop.rs");
+        let forbidden = ["error", " = %", "error"].concat();
+        assert!(
+            !source.contains(&forbidden),
+            "turn loop 日志不得记录原始 error 字段: {forbidden}"
         );
     }
 }

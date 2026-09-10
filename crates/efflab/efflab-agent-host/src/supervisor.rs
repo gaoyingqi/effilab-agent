@@ -129,6 +129,32 @@ pub enum SupervisorError {
     },
 }
 
+impl SupervisorError {
+    /// 返回稳定的英文错误分类；日志不读取底层 I/O 文本或路径。
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidPathComponent => "invalid_path_component",
+            Self::HomeRootMustBeAbsolute => "home_root_not_absolute",
+            Self::HomeRootContainsParentDirectory => "home_root_contains_parent_directory",
+            Self::Unavailable { .. } => "capability_unavailable",
+            Self::EnvironmentVariableNotAllowed { .. } => "environment_variable_not_allowed",
+            Self::EnvironmentVariableNotWhitelisted { .. } => {
+                "environment_variable_not_whitelisted"
+            }
+            Self::EnvironmentValueNotAllowed { .. } => "environment_value_not_allowed",
+            Self::LlmChannelUnavailable => "llm_channel_unavailable",
+            Self::McpSpecUnavailable => "mcp_spec_unavailable",
+            Self::ScopeAlreadyRunning => "scope_already_running",
+            Self::ConfigRenderFailed => "config_render_failed",
+            Self::ConfigWriteFailed => "config_write_failed",
+            Self::RestartFailed => "restart_failed",
+            Self::StateUnavailable => "state_unavailable",
+            Self::StdioUnavailable => "stdio_unavailable",
+            Self::Io { .. } => "io_failure",
+        }
+    }
+}
+
 impl fmt::Display for SupervisorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -169,6 +195,24 @@ impl std::error::Error for SupervisorError {
             _ => None,
         }
     }
+}
+
+/// 记录不含底层 I/O 文本的生命周期阶段失败。
+fn log_stage_failure(stage: &'static str, error: &SupervisorError) {
+    log::error!(
+        "Agent Kit lifecycle stage={} failed error_code={}",
+        stage,
+        error.code()
+    );
+}
+
+/// 简体中文注释：记录并返回一个生命周期阶段错误，保证提前返回也有统一诊断。
+fn fail_lifecycle_stage<T>(
+    stage: &'static str,
+    error: SupervisorError,
+) -> Result<T, SupervisorError> {
+    log_stage_failure(stage, &error);
+    Err(error)
 }
 
 /// 将 app_id 或 scope 约束为单一、不可遍历的目录组件。
@@ -323,12 +367,12 @@ fn terminate_and_reap_detached_process(mut process: ManagedSidecar) {
 /// `Arc`。失败只记 debug：`ESRCH` 代表 group 已空，其他错误仍保留既有 stop/natural-exit
 /// 状态机的完成语义。
 fn kill_process_group_after_leader_exit(process: &ManagedSidecar) {
-    if let Err(source) = process.process_group.kill() {
+    if process.process_group.kill().is_err() {
         tracing::debug!(
-            scope = %process.scope_id,
+            event = "process_group_cleanup_failed",
+            scope_present = !process.scope_id.is_empty(),
             generation = process.generation,
-            error = %source,
-            "sidecar leader 已回收，但 process group 清理失败"
+            "sidecar process group cleanup failed"
         );
     }
 }
@@ -395,6 +439,7 @@ impl Supervisor {
         config: HostRuntimeConfig,
         app_id: impl AsRef<str>,
     ) -> Result<Self, SupervisorError> {
+        log::info!("Agent Kit lifecycle stage=supervisor_initialization started");
         validate_absolute_path(&config.home_root)?;
         validate_absolute_path(&config.sidecar_log_path)?;
         let app_id = sanitize(app_id.as_ref())?;
@@ -416,6 +461,7 @@ impl Supervisor {
         config.home_root = home_root;
         config.sidecar_log_path = sidecar_log_path;
         tracing::debug!("Host 注入的 home_root 与 sidecar 日志路径前缀已 canonicalize");
+        log::info!("Agent Kit lifecycle stage=supervisor_initialization completed");
 
         Ok(Self {
             config,
@@ -493,22 +539,43 @@ impl Supervisor {
         channel: &LlmChannelManager,
         approved_mcp: &ApprovedMcpSpecV1,
     ) -> Result<SidecarProcessInfo, SupervisorError> {
+        log::info!("Agent Kit lifecycle stage=sidecar_launch started");
         if let SupervisorCapability::Unavailable { reason } = self.capability() {
-            return Err(SupervisorError::Unavailable { reason });
+            return fail_lifecycle_stage("sidecar_launch", SupervisorError::Unavailable { reason });
         }
-        let (model_id, channel_revision) = channel
-            .sidecar_model()
-            .map_err(|_| SupervisorError::LlmChannelUnavailable)?;
-        let scope_id = sanitize(scope)?;
-        let slot = self.acquire(&scope_id)?;
-        let (paths, generation) = prepare_slot_launch(&slot)?;
+        let (model_id, channel_revision) = match channel.sidecar_model() {
+            Ok(identity) => identity,
+            Err(_) => {
+                return fail_lifecycle_stage(
+                    "sidecar_launch",
+                    SupervisorError::LlmChannelUnavailable,
+                );
+            }
+        };
+        let scope_id = match sanitize(scope) {
+            Ok(scope_id) => scope_id,
+            Err(error) => return fail_lifecycle_stage("sidecar_launch", error),
+        };
+        let slot = match self.acquire(&scope_id) {
+            Ok(slot) => slot,
+            Err(error) => return fail_lifecycle_stage("sidecar_launch", error),
+        };
+        let (paths, generation) = match prepare_slot_launch(&slot) {
+            Ok(launch) => launch,
+            Err(error) => return fail_lifecycle_stage("sidecar_launch", error),
+        };
 
         // L3b 已经由 service 启动；先注册本代 token，后续任何失败都会立即使它失效。
         let token = match loopback.register_binding(&scope_id, generation, channel_revision) {
             Ok(token) => token,
             Err(_) => {
-                clear_launching(&slot)?;
-                return Err(SupervisorError::LlmChannelUnavailable);
+                if let Err(error) = clear_launching(&slot) {
+                    log_stage_failure("sidecar_launch_cleanup", &error);
+                }
+                return fail_lifecycle_stage(
+                    "sidecar_launch",
+                    SupervisorError::LlmChannelUnavailable,
+                );
             }
         };
         let registry = loopback.registry();
@@ -527,6 +594,14 @@ impl Supervisor {
         if result.is_err() {
             registry.invalidate_generation(&scope_id, generation);
             let _ = clear_launching(&slot);
+        }
+        match &result {
+            Ok(info) => log::info!(
+                "Agent Kit lifecycle stage=sidecar_launch completed generation={} sidecar_pid={}",
+                info.generation,
+                info.pid
+            ),
+            Err(error) => log_stage_failure("sidecar_launch", error),
         }
         result
     }
@@ -563,7 +638,7 @@ impl Supervisor {
         let mut failed = false;
         for scope in &scopes {
             if let Err(error) = self.stop_scope(scope) {
-                tracing::error!(scope = %scope, error = %error, "sidecar 停止失败");
+                log_stage_failure("sidecar_restart_stop", &error);
                 failed = true;
             }
         }
@@ -571,13 +646,13 @@ impl Supervisor {
             let approved_mcp = match mcp_for_scope(scope) {
                 Ok(spec) => spec,
                 Err(error) => {
-                    tracing::error!(scope = %scope, error = %error, "sidecar 重启缺少 MCP 批准规格");
+                    log_stage_failure("sidecar_restart_mcp_spec", &error);
                     failed = true;
                     continue;
                 }
             };
             if let Err(error) = self.launch_sidecar(scope, loopback, channel, &approved_mcp) {
-                tracing::error!(scope = %scope, error = %error, "sidecar 重启启动失败");
+                log_stage_failure("sidecar_restart_launch", &error);
                 failed = true;
             }
         }
@@ -618,36 +693,83 @@ impl Supervisor {
         registry: Arc<BindingTokenRegistry>,
         paths: ScopePaths,
     ) -> Result<SidecarProcessInfo, SupervisorError> {
-        prepare_scope_directories(&paths)?;
-        let rendered = render_runtime_config(
+        log::info!("Agent Kit lifecycle stage=scope_directories started");
+        if let Err(error) = prepare_scope_directories(&paths) {
+            log_stage_failure("scope_directories", &error);
+            return Err(error);
+        }
+        log::info!("Agent Kit lifecycle stage=scope_directories completed");
+
+        log::info!("Agent Kit lifecycle stage=runtime_config_render started");
+        let rendered = match render_runtime_config(
             &paths,
             model_id,
             loopback,
             approved_mcp,
             &self.config.system_prompt,
-        )?;
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                log_stage_failure("runtime_config_render", &error);
+                return Err(error);
+            }
+        };
+        log::info!("Agent Kit lifecycle stage=runtime_config_render completed");
         let runtime_config_path = paths.home.join(RUNTIME_CONFIG_FILENAME);
-        write_authoritative_config(&runtime_config_path, rendered.as_bytes())?;
+        log::info!("Agent Kit lifecycle stage=runtime_config_write started");
+        if let Err(error) = write_authoritative_config(&runtime_config_path, rendered.as_bytes()) {
+            log_stage_failure("runtime_config_write", &error);
+            return Err(error);
+        }
+        log::info!("Agent Kit lifecycle stage=runtime_config_write completed");
 
         // 仅此处把 binding token 注入 child；用户 Key 从不在 env、CLI 或 TOML 中出现。
-        let environment = ChildEnvironment::for_sidecar_with_binding(&paths.home, &token)?;
-        let mut log_file = open_sidecar_log_file(&self.config.sidecar_log_path)?;
+        log::info!("Agent Kit lifecycle stage=child_environment started");
+        let environment = match ChildEnvironment::for_sidecar_with_binding(&paths.home, &token) {
+            Ok(environment) => environment,
+            Err(error) => {
+                log_stage_failure("child_environment", &error);
+                return Err(error);
+            }
+        };
+        log::info!("Agent Kit lifecycle stage=child_environment completed");
+        log::info!("Agent Kit lifecycle stage=sidecar_log_open started");
+        let mut log_file = match open_sidecar_log_file(&self.config.sidecar_log_path) {
+            Ok(log_file) => {
+                log::info!("Agent Kit lifecycle stage=sidecar_log_open completed");
+                log_file
+            }
+            Err(error) => {
+                log_stage_failure("sidecar_log_open", &error);
+                return Err(error);
+            }
+        };
         let spawned_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
-        writeln!(
+        if let Err(source) = writeln!(
             log_file,
             "--- sidecar spawn scope={scope_id} generation={generation} unix={spawned_at} ---"
-        )
-        .map_err(|source| SupervisorError::Io {
-            operation: "写入 sidecar 日志头",
-            source,
-        })?;
-        let stderr = Stdio::from(log_file.try_clone().map_err(|source| SupervisorError::Io {
-            operation: "复制 sidecar 日志句柄",
-            source,
-        })?);
+        ) {
+            let error = SupervisorError::Io {
+                operation: "写入 sidecar 日志头",
+                source,
+            };
+            log_stage_failure("sidecar_log_header", &error);
+            return Err(error);
+        }
+        let stderr = match log_file.try_clone() {
+            Ok(file) => Stdio::from(file),
+            Err(source) => {
+                let error = SupervisorError::Io {
+                    operation: "复制 sidecar 日志句柄",
+                    source,
+                };
+                log_stage_failure("sidecar_log_handle", &error);
+                return Err(error);
+            }
+        };
         let mut command = Command::new(&self.config.sidecar_bin);
         command
             .arg("--runtime-config")
@@ -661,16 +783,23 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(stderr);
         environment.apply(&mut command);
+        log::info!("Agent Kit lifecycle stage=sidecar_spawn started");
         let (child, process_group) = match spawn_enrolled_sidecar(&mut command, &self.process_scope)
         {
             Ok(spawned) => spawned,
             Err(error) => {
-                let _ = writeln!(log_file, "--- sidecar spawn failed: {error} ---");
+                log_stage_failure("sidecar_spawn", &error);
+                let _ = writeln!(
+                    log_file,
+                    "--- sidecar spawn failed error_code={} ---",
+                    error.code()
+                );
                 let _ = log_file.flush();
                 return Err(error);
             }
         };
         let pid = child.id();
+        log::info!("Agent Kit lifecycle stage=sidecar_spawn completed sidecar_pid={pid}");
         let _ = writeln!(log_file, "--- sidecar pid={pid} ---");
         let _ = log_file.flush();
         drop(log_file);
@@ -683,7 +812,12 @@ impl Supervisor {
             scope_id: scope_id.to_string(),
             generation,
         });
-        child_guard.attach(slot, pid)?;
+        log::info!("Agent Kit lifecycle stage=slot_attach started");
+        if let Err(error) = child_guard.attach(slot, pid) {
+            log_stage_failure("slot_attach", &error);
+            return Err(error);
+        }
+        log::info!("Agent Kit lifecycle stage=slot_attach completed");
         // watcher 只观察这一 generation；child 自然退出后 token 无需等下一次 dispatch 即失效。
         watch_sidecar_exit(Arc::clone(slot), generation);
         tracing::debug!(
@@ -1070,12 +1204,12 @@ fn stop_slot_with_kill(
             return Err(error);
         }
         // leader 已收到 kill 但尚未 wait/reap，pgid 仍不可复用；此时再杀完整 tree。
-        if let Err(source) = process.process_group.kill() {
+        if process.process_group.kill().is_err() {
             tracing::debug!(
-                scope = %process.scope_id,
+                event = "process_group_cleanup_failed",
+                scope_present = !process.scope_id.is_empty(),
                 generation = process.generation,
-                error = %source,
-                "sidecar leader 已终止，但 process group 清理失败"
+                "sidecar process group cleanup failed"
             );
         }
         if let Err(source) = process.child.wait() {
@@ -1197,10 +1331,22 @@ fn prepare_scope_directories(paths: &ScopePaths) -> Result<(), SupervisorError> 
     #[cfg(windows)]
     {
         for directory in [&paths.home, &paths.workspace] {
-            platform::ensure_private_directory(directory)
-                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
-            platform::verify_private_directory(directory)
-                .map_err(|_| SupervisorError::ConfigWriteFailed)?;
+            platform::ensure_private_directory(directory).map_err(|source| {
+                log::error!(
+                    "Agent Kit lifecycle stage=scope_directories failed error_code=config_write_failed io_kind={:?} detail={}",
+                    source.kind(),
+                    source
+                );
+                SupervisorError::ConfigWriteFailed
+            })?;
+            platform::verify_private_directory(directory).map_err(|source| {
+                log::error!(
+                    "Agent Kit lifecycle stage=scope_directories failed error_code=config_write_failed io_kind={:?} detail={}",
+                    source.kind(),
+                    source
+                );
+                SupervisorError::ConfigWriteFailed
+            })?;
         }
         return Ok(());
     }

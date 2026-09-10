@@ -562,6 +562,7 @@ mod windows {
     const INVALID_HANDLE_VALUE: Handle = (-1isize) as Handle;
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
     const DELETE: u32 = 0x0001_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
@@ -1571,14 +1572,18 @@ mod windows {
             information: 0,
         };
         let mut handle = ptr::null_mut();
+        // 简体中文注释：已有目录只申请列举/遍历。C:\Users 对 Users 组通常只有 RX，
+        // 再申请 GENERIC_WRITE 会在商店包和普通 AppData 上直接 ACCESS_DENIED。
         let desired_access = if delete_access {
             GENERIC_READ | DELETE | SYNCHRONIZE
         } else if exclusive {
             GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | SYNCHRONIZE
         } else if create {
             GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | SYNCHRONIZE
-        } else if write || matches!(kind, EntryKind::Directory) {
+        } else if write {
             GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE
+        } else if matches!(kind, EntryKind::Directory) {
+            GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE
         } else {
             GENERIC_READ | SYNCHRONIZE
         };
@@ -1660,53 +1665,61 @@ mod windows {
         Ok(file)
     }
 
+    fn open_existing_directory_component(
+        parent: &SecureDirectory,
+        name: &OsStr,
+        share_delete: bool,
+        write: bool,
+    ) -> io::Result<File> {
+        let (_, file) = open_file_at_with_options(
+            parent.handle.as_raw_handle(),
+            name,
+            write,
+            EntryKind::Directory,
+            false,
+            false,
+            share_delete,
+            false,
+        )?;
+        Ok(file)
+    }
+
     fn open_directory_component_with_sharing(
         parent: &SecureDirectory,
         name: &OsStr,
         create: bool,
         share_delete: bool,
     ) -> io::Result<(SecureDirectory, bool)> {
-        if !create {
-            let (_, file) = open_file_at_with_options(
-                parent.handle.as_raw_handle(),
-                name,
-                false,
-                EntryKind::Directory,
-                false,
-                false,
-                share_delete,
-                false,
-            )?;
-            return Ok((SecureDirectory { handle: file }, false));
+        // 简体中文注释：已有祖先先尝试写打开；C:\Users 这类 RX 目录会 ACCESS_DENIED，
+        // 再回退只读遍历。最终可写目录仍拿到 GENERIC_WRITE，以便创建子项和刷新。
+        match open_existing_directory_component(parent, name, share_delete, true) {
+            Ok(file) => return Ok((SecureDirectory { handle: file }, false)),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                match open_existing_directory_component(parent, name, share_delete, false) {
+                    Ok(file) => return Ok((SecureDirectory { handle: file }, false)),
+                    Err(fallback) if !create || fallback.kind() != io::ErrorKind::NotFound => {
+                        return Err(fallback);
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(error) if !create || error.kind() != io::ErrorKind::NotFound => {
+                return Err(error);
+            }
+            Err(_) => {}
         }
 
-        // 先用只读目录权限打开已有组件，避免对父目录不必要地申请 WRITE_DAC。
-        match open_file_at_with_options(
+        let (created, file) = open_file_at_with_options(
             parent.handle.as_raw_handle(),
             name,
-            false,
+            true,
             EntryKind::Directory,
-            false,
+            true,
             false,
             share_delete,
             false,
-        ) {
-            Ok((_, file)) => Ok((SecureDirectory { handle: file }, false)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let (created, file) = open_file_at_with_options(
-                    parent.handle.as_raw_handle(),
-                    name,
-                    true,
-                    EntryKind::Directory,
-                    true,
-                    false,
-                    share_delete,
-                    false,
-                )?;
-                Ok((SecureDirectory { handle: file }, created))
-            }
-            Err(error) => Err(error),
-        }
+        )?;
+        Ok((SecureDirectory { handle: file }, created))
     }
 
     fn path_components(path: &Path) -> io::Result<(u8, Vec<OsString>)> {
@@ -2408,7 +2421,8 @@ mod windows {
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "日志文件缺少最终名称"))?;
-        let parent = open_directory_chain(parent_path, true, true)?;
+        // 产品日志目录由 Tauri 管理，允许其继承 ACL；只保护最终 sidecar 日志文件。
+        let parent = open_directory_chain(parent_path, true, false)?;
         let (created, mut file) = open_file_at_with_state(&parent, name, true, false, true, false)?;
         if created {
             set_owner_only_acl(&file)?;
@@ -2981,7 +2995,7 @@ mod windows {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::Path;
 
     fn test_tempdir() -> tempfile::TempDir {
@@ -3128,6 +3142,25 @@ mod tests {
         let hard_link = directory.join("legacy-link");
         if fs::hard_link(&file, &hard_link).is_ok() {
             assert!(read_regular_file(&file, 64).is_err());
+        }
+    }
+
+    #[test]
+    fn ensure_private_directory_can_walk_user_profile_temp() {
+        // 简体中文注释：产品 sqlite / 模型目录位于用户 AppData。这里用同一棵
+        // 用户配置文件树验证已有祖先只读打开，避免只在 D: 仓库临时目录里假绿。
+        let path = std::env::temp_dir()
+            .join("efflab-agent-platform-profile-walk")
+            .join("home");
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+        ensure_private_directory(&path).unwrap_or_else(|error| {
+            panic!("必须能在用户 AppData Temp 下创建私有目录，错误={error:?}")
+        });
+        verify_private_directory(&path).expect("校验用户配置文件树下的私有目录");
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
         }
     }
 
@@ -3337,5 +3370,24 @@ mod tests {
             read_private_file(&log, 1024).expect("读取追加日志"),
             b"first\nsecond\n"
         );
+    }
+
+    #[test]
+    fn private_append_file_accepts_existing_public_log_directory() {
+        let temporary = test_tempdir();
+        let log_dir = private_path(temporary.path(), "logs");
+        fs::create_dir(&log_dir).expect("创建公共日志目录");
+        let log = log_dir.join("sidecar.log");
+
+        let mut file = open_or_create_private_append(&log)
+            .expect("公共日志目录的 ACL 不应阻止私有 sidecar 日志文件");
+        file.write_all(b"public-parent\n").expect("写入日志");
+        file.seek(SeekFrom::Start(0))
+            .expect("定位 sidecar 日志开头");
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)
+            .expect("读取私有 sidecar 日志");
+
+        assert_eq!(content, b"public-parent\n");
     }
 }

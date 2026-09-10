@@ -1005,7 +1005,7 @@ fn channel_set_accepts_user_http_loopback_and_lan_without_development_flag() {
     }
 }
 
-/// restart 局部失败时，新 Channel 已提交，调用方必须收到可重试错误而不是旧 view。
+/// restart 局部失败时，新 Channel 已提交，调用方必须收到引导重启应用的错误而不是旧 view。
 #[test]
 fn channel_change_keeps_committed_view_when_live_scope_restart_fails() {
     let temporary = tempfile::tempdir().expect("必须能创建 restart 失败测试目录");
@@ -1050,7 +1050,15 @@ fn channel_change_keeps_committed_view_when_live_scope_restart_fails() {
         })
         .expect_err("已存活 scope 的二次 spawn 失败必须返回错误");
     assert_eq!(error, LlmChannelError::RestartFailed);
-    assert!(error.as_kit_error().retryable, "restart 失败必须明确可重试");
+    let kit_error = error.as_kit_error();
+    assert!(
+        !kit_error.retryable,
+        "restart 失败后应引导用户重启应用，而不是继续重试"
+    );
+    assert_eq!(
+        kit_error.message,
+        "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试"
+    );
     let view = service.view().expect("失败后仍必须可读取 committed view");
     assert_eq!(view.kind, Some(LlmChannelKind::Byok));
     assert!(view.key_present, "新提交的 Key view 不得回退为未配置");

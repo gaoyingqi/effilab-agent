@@ -1,8 +1,8 @@
 //! 可信 Host 的 ACP stdio JSON-RPC 运行时。
 //!
 //! 此模块只负责拆分后的 stdin/stdout 传输、消息复用与反向 RPC 回复校验；
-//! 不启动 sidecar，也不把 ACP 类型泄漏到产品层。DEBUG 级别会输出截断后的
-//! Host↔sidecar JSON-RPC 预览，并对 token/key 等字段脱敏。
+//! 不启动 sidecar，也不把 ACP 类型泄漏到产品层。DEBUG 级别只输出
+//! Host↔sidecar JSON-RPC 的结构化元数据，不记录任何 wire payload。
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
@@ -40,8 +40,6 @@ const MAX_PENDING_REQUESTS: usize = 64;
 const READER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 /// reader worker 轮询结束状态的间隔，避免关闭路径忙等。
 const READER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
-/// DEBUG 日志中 ACP JSON 预览上限。
-const ACP_WIRE_PREVIEW_BYTES: usize = 4096;
 
 /// Host 使用的数值 JSON-RPC request id。
 ///
@@ -224,12 +222,12 @@ impl AcpRuntime {
         let requested = Arc::new(AtomicBool::new(false));
         let shutdown_pair = match UnixStream::pair() {
             Ok(pair) => Some(pair),
-            Err(error) => {
+            Err(_) => {
                 // 构造函数不能返回 Result；没有关闭唤醒管道时直接标记 transport 不可用，
                 // 不启动一个无法受控的 reader worker。
                 tracing::error!(
-                    error = %error,
-                    "无法创建 ACP reader shutdown 管道，transport 将 fail-closed"
+                    error_code = "shutdown_control_unavailable",
+                    "ACP reader shutdown pipe unavailable; transport fail-closed"
                 );
                 if let Ok(mut terminal) = terminal_error.lock() {
                     *terminal = Some("ACP reader shutdown control unavailable".to_string());
@@ -635,8 +633,8 @@ impl AcpRuntime {
 impl Drop for AcpRuntime {
     fn drop(&mut self) {
         // Drop 不能返回错误；仍尝试完整 shutdown，并只记录不含 payload 的生命周期错误。
-        if let Err(error) = self.shutdown() {
-            eprintln!("ACP runtime shutdown 失败: {error}");
+        if self.shutdown().is_err() {
+            eprintln!("ACP runtime shutdown failed error_code=shutdown_failed");
         }
     }
 }
@@ -1184,66 +1182,10 @@ fn validate_permission_result(result: &Value, request_params: &Value) -> Result<
     }
 }
 
-/// 按 UTF-8 字节边界截断 ACP 预览，避免整行 JSON 打满日志。
-fn truncate_acp_preview(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…<truncated,total_bytes={}>", &text[..end], text.len())
-}
-
-/// 识别不应进入 DEBUG 日志的凭据字段名。
-fn is_sensitive_acp_key(key: &str) -> bool {
-    let normalized = key.replace('-', "_").to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "authorization"
-            | "api_key"
-            | "apikey"
-            | "access_token"
-            | "app_key"
-            | "password"
-            | "secret"
-            | "binding"
-            | "token"
-            | "env_key"
-    ) || normalized.ends_with("_token")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_password")
-        || (normalized.ends_with("_key") && normalized.contains("api"))
-}
-
-/// 递归脱敏 JSON 对象中的凭据字段，保留 method/id/prompt 等追踪字段。
-fn redact_acp_json(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut redacted = serde_json::Map::new();
-            for (key, child) in map {
-                if is_sensitive_acp_key(key) {
-                    redacted.insert(key.clone(), Value::String("<redacted>".to_owned()));
-                } else {
-                    redacted.insert(key.clone(), redact_acp_json(child));
-                }
-            }
-            Value::Object(redacted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(redact_acp_json).collect()),
-        other => other.clone(),
-    }
-}
-
-/// 记录一条已解析的 ACP JSON-RPC 消息，仅 DEBUG 且不含凭据明文。
-fn log_acp_wire(direction: &'static str, payload: &Value) {
-    if !tracing::enabled!(tracing::Level::DEBUG) {
-        return;
-    }
-    let method = payload.get("method").and_then(Value::as_str);
-    let id = payload.get("id").map(ToString::to_string);
-    let kind = if method.is_some() {
+/// 返回不含外部字段内容的 ACP 消息类别。
+fn acp_wire_kind(payload: &Value) -> &'static str {
+    let has_method = payload.get("method").is_some();
+    if has_method {
         if payload.get("id").is_some() {
             "request"
         } else {
@@ -1253,37 +1195,59 @@ fn log_acp_wire(direction: &'static str, payload: &Value) {
         "error_response"
     } else {
         "response"
-    };
-    let preview = truncate_acp_preview(
-        &redact_acp_json(payload).to_string(),
-        ACP_WIRE_PREVIEW_BYTES,
-    );
+    }
+}
+
+/// 记录一条已解析的 ACP JSON-RPC 元数据，不记录 payload 或任何外部字段值。
+fn log_acp_wire(direction: &'static str, payload: &Value) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let has_method = payload.get("method").is_some();
+    let has_id = payload.get("id").is_some();
+    let has_error = payload.get("error").is_some();
+    let payload_bytes = serde_json::to_vec(payload).map_or(0, |encoded| encoded.len());
     tracing::debug!(
         event = "acp_wire",
         direction,
-        kind,
-        method,
-        id = id.as_deref(),
-        payload_bytes = preview.len(),
-        payload = %preview,
-        "ACP Host↔sidecar 消息"
+        kind = acp_wire_kind(payload),
+        has_method,
+        has_id,
+        has_error,
+        payload_bytes,
+        "ACP wire metadata"
     );
 }
 
-/// 将 stdout 原始行解析后记入 DEBUG；无法解析时仍输出截断文本。
+/// 将 stdout 原始行解析后记入 DEBUG；无法解析时也只记录稳定元数据。
 fn log_acp_wire_line(direction: &'static str, line: &str) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let payload_bytes = line.len();
     match serde_json::from_str::<Value>(line) {
-        Ok(value) => log_acp_wire(direction, &value),
+        Ok(value) => {
+            let has_method = value.get("method").is_some();
+            let has_id = value.get("id").is_some();
+            let has_error = value.get("error").is_some();
+            tracing::debug!(
+                event = "acp_wire",
+                direction,
+                kind = acp_wire_kind(&value),
+                has_method,
+                has_id,
+                has_error,
+                payload_bytes,
+                "ACP wire metadata"
+            );
+        }
         Err(_) => {
-            if !tracing::enabled!(tracing::Level::DEBUG) {
-                return;
-            }
             tracing::debug!(
                 event = "acp_wire",
                 direction,
                 kind = "unparsed",
-                payload = %truncate_acp_preview(line, ACP_WIRE_PREVIEW_BYTES),
-                "ACP Host↔sidecar 非 JSON 行"
+                payload_bytes,
+                "ACP wire metadata"
             );
         }
     }
@@ -1310,30 +1274,6 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn redact_acp_json_keeps_prompt_and_hides_credentials() {
-        let value = json!({
-            "method": "session/prompt",
-            "params": {
-                "prompt": [{"type": "text", "text": "hello"}],
-                "api_key": "should-not-log",
-                "access_token": "should-not-log",
-            }
-        });
-        let redacted = redact_acp_json(&value);
-        assert_eq!(redacted["method"], "session/prompt");
-        assert_eq!(redacted["params"]["prompt"][0]["text"], "hello");
-        assert_eq!(redacted["params"]["api_key"], "<redacted>");
-        assert_eq!(redacted["params"]["access_token"], "<redacted>");
-    }
-
-    #[test]
-    fn truncate_acp_preview_marks_overflow() {
-        let preview = truncate_acp_preview("abcdefghij", 4);
-        assert!(preview.contains("truncated,total_bytes=10"), "{preview}");
-        assert!(preview.starts_with("abcd"), "{preview}");
     }
 
     #[test]
@@ -1446,5 +1386,148 @@ mod tests {
             "shutdown 不得等待不可取消的 reader worker"
         );
         drop(runtime);
+    }
+}
+
+#[cfg(test)]
+mod wire_log_tests {
+    use super::{log_acp_wire, log_acp_wire_line};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber, field, span};
+
+    #[derive(Clone, Default)]
+    struct WireLogCapture {
+        records: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl WireLogCapture {
+        /// 复制捕获的结构化字段，供 subscriber guard 释放后断言。
+        fn records(&self) -> Vec<BTreeMap<String, String>> {
+            self.records.lock().expect("日志捕获锁不应中毒").clone()
+        }
+    }
+
+    struct WireFieldCapture {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl field::Visit for WireFieldCapture {
+        /// 统一保存 tracing 的 Debug 字段，避免测试依赖格式化日志文本。
+        fn record_debug(&mut self, field: &field::Field, value: &dyn fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        /// 保存结构化字符串字段的原值。
+        fn record_str(&mut self, field: &field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        /// 保存结构化布尔字段的原值。
+        fn record_bool(&mut self, field: &field::Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        /// 保存结构化无符号计数字段的十进制表示。
+        fn record_u64(&mut self, field: &field::Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl Subscriber for WireLogCapture {
+        /// 只接收 ACP wire 的 DEBUG 事件。
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+
+        /// 测试不建立 span，返回固定有效 ID。
+        fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        /// 测试不使用 span 字段。
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        /// 测试不建立 span 因果关系。
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        /// 记录结构化事件字段，不格式化外部 ACP payload。
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = WireFieldCapture {
+                fields: BTreeMap::new(),
+            };
+            event.record(&mut visitor);
+            self.records
+                .lock()
+                .expect("日志捕获锁不应中毒")
+                .push(visitor.fields);
+        }
+
+        /// 测试不进入 span。
+        fn enter(&self, _span: &span::Id) {}
+
+        /// 测试不退出 span。
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    #[test]
+    fn acp_wire_logs_metadata_without_payload() {
+        let capture = WireLogCapture::default();
+        let value = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/prompt",
+            "params": {
+                "prompt": [{"type": "text", "text": "prompt-secret"}],
+                "endpoint": "https://secret.example/v1/chat/completions",
+                "api_key": "api-key-secret",
+            }
+        });
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            log_acp_wire("host_to_sidecar", &value);
+            log_acp_wire_line(
+                "sidecar_to_host",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"text": "response-secret"}
+                })
+                .to_string(),
+            );
+            log_acp_wire_line("sidecar_to_host", "unparsed-secret");
+        }
+
+        let records = capture.records();
+        assert_eq!(records.len(), 3, "应分别记录 parsed/unparsed ACP 元数据");
+        let rendered = format!("{records:?}");
+        assert!(!rendered.contains("prompt-secret"), "{rendered}");
+        assert!(!rendered.contains("secret.example"), "{rendered}");
+        assert!(!rendered.contains("api-key-secret"), "{rendered}");
+        assert!(!rendered.contains("response-secret"), "{rendered}");
+        assert!(!rendered.contains("unparsed-secret"), "{rendered}");
+        assert!(records.iter().all(|fields| !fields.contains_key("payload")));
+    }
+
+    /// ACP transport 失败日志只能记录固定分类，不能输出底层错误值。
+    #[test]
+    fn transport_failure_logs_do_not_render_error_values() {
+        let source = include_str!("acp_runtime.rs");
+        let forbidden = ["error", " = %", "error"].concat();
+        assert!(
+            !source.contains(&forbidden),
+            "ACP transport 日志不得记录原始 error 字段: {forbidden}"
+        );
+        let forbidden_drop = ["eprintln!", "(\"ACP runtime shutdown 失败: {error}"] .concat();
+        assert!(
+            !source.contains(&forbidden_drop),
+            "ACP runtime Drop 不得输出底层 shutdown 错误: {forbidden_drop}"
+        );
     }
 }

@@ -111,7 +111,7 @@ impl SidecarConfig {
         if !cli.stdio {
             bail!("当前仅支持 --stdio");
         }
-        // Windows 的 owner-only hardening 尚未 proven；直接解析也必须 fail-closed。
+        // 平台 capability 必须先通过，后续目录和文件访问才能继续。
         crate::hardening::ensure_platform_supported()?;
 
         let runtime_config_input = cli

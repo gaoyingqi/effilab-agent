@@ -1038,7 +1038,11 @@ impl acp::Agent for MinimalAgent {
                 Ok(response)
             }
             Err(error) => {
-                tracing::debug!(event = "prompt_failed", error = %error, "prompt 以稳定错误结束");
+                tracing::debug!(
+                    event = "prompt_failed",
+                    error_code = error.code(),
+                    "Prompt failed with a stable error code"
+                );
                 Err(turn_error_to_acp(error))
             }
         }
@@ -1306,4 +1310,15 @@ mod tests {
     /// 保留类型引用，确保测试只检查 agent 自身状态而不引入跨线程同步假设。
     #[allow(dead_code)]
     fn _state_type_is_local(_: Rc<RefCell<RuntimeState>>) {}
+
+    /// prompt 失败日志只能记录稳定错误码，不能回显底层错误值。
+    #[test]
+    fn prompt_failure_log_uses_stable_error_code() {
+        let source = include_str!("acp_agent.rs");
+        let forbidden = ["error", " = %", "error"].concat();
+        assert!(
+            !source.contains(&forbidden),
+            "ACP prompt 日志不得记录原始 error 字段: {forbidden}"
+        );
+    }
 }

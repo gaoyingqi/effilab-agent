@@ -826,11 +826,18 @@ fn supervisor_rejects_relative_home_root() {
 #[test]
 fn supervisor_rejects_parent_directory_before_canonicalization() {
     let temporary = tempfile::tempdir().expect("创建 parent-dir 路径测试目录应成功");
-    let mut home_root =
+    let canonical_root =
         fs::canonicalize(temporary.path()).expect("临时目录的现有前缀必须可 canonicalize");
-    home_root.push("app-data");
-    home_root.push("..");
-    home_root.push("escaped");
+    // 简体中文注释：Windows 的 PathBuf::push 会规范化单独的 `..`，此处用原始分隔符保留待拒绝组件。
+    let home_root = if cfg!(windows) {
+        PathBuf::from(format!(r"{}\app-data\..\escaped", canonical_root.display()))
+    } else {
+        let mut path = canonical_root;
+        path.push("app-data");
+        path.push("..");
+        path.push("escaped");
+        path
+    };
 
     let error = Supervisor::new(config(home_root), "app")
         .err()

@@ -49,17 +49,14 @@ pub struct BindingContext {
     pub channel_revision: u64,
 }
 
-/// 至少 256 bit 的 sidecar binding token；永不实现会回显内容的 Debug。
+/// 至少 256 bit 的 sidecar binding token；Debug 形状永不回显 token 或其摘要。
 #[derive(Clone, PartialEq, Eq)]
 pub struct BindingToken([u8; 32]);
 
 impl fmt::Debug for BindingToken {
-    /// token 的调试形状只给出不可逆短指纹，避免日志意外泄露 bearer 值。
+    /// token 的调试形状固定为脱敏文本，避免日志意外泄露 bearer 值或关联摘要。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("BindingToken")
-            .field(&format_args!("fingerprint:{}", self.fingerprint()))
-            .finish()
+        formatter.write_str("BindingToken(<redacted>)")
     }
 }
 
@@ -78,11 +75,6 @@ impl BindingToken {
         URL_SAFE_NO_PAD.encode(self.0)
     }
 
-    /// 用于允许的调试日志的不可逆短指纹。
-    fn fingerprint(&self) -> String {
-        let digest = blake3::hash(&self.0).to_hex().to_string();
-        digest[..12].to_string()
-    }
 }
 
 /// 仅在 registry 内保存的 token 与活动标志；不派生 Debug 以防遗漏脱敏。
@@ -137,7 +129,6 @@ impl BindingTokenRegistry {
             return Err(L3bLoopbackError::InvalidBindingContext);
         }
         let token = BindingToken::generate()?;
-        let fingerprint = token.fingerprint();
         let context = BindingContext {
             scope_id,
             generation,
@@ -159,11 +150,11 @@ impl BindingTokenRegistry {
         };
         drop(records);
         tracing::debug!(
-            token_fingerprint = %fingerprint,
-            scope = %context.scope_id,
+            event = "l3b_binding_registered",
+            scope_present = !context.scope_id.is_empty(),
             generation = context.generation,
             channel_revision = context.channel_revision,
-            "L3b binding token 已注册"
+            "L3b binding registered"
         );
         Ok(token)
     }
@@ -211,11 +202,11 @@ impl BindingTokenRegistry {
                 record.active = false;
                 invalidated += 1;
                 tracing::debug!(
-                    token_fingerprint = %record.token.fingerprint(),
-                    scope = %record.context.scope_id,
+                    event = "l3b_binding_invalidated",
+                    scope_present = !record.context.scope_id.is_empty(),
                     generation = record.context.generation,
                     channel_revision = record.context.channel_revision,
-                    "L3b binding token 已失效"
+                    "L3b binding invalidated"
                 );
             }
         }
@@ -267,6 +258,23 @@ pub enum L3bLoopbackError {
     RegistryUnavailable,
     /// 所有固定 slot 仍由活动 sidecar 占用，不能无界追加 token 历史。
     RegistryCapacityExhausted,
+}
+
+impl L3bLoopbackError {
+    /// 返回稳定的英文错误分类；日志不记录监听地址或底层错误文本。
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::InvalidListenAddress => "invalid_listen_address",
+            Self::ChannelUnconfigured => "channel_unconfigured",
+            Self::BindFailed => "bind_failed",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::ServeFailed => "serve_failed",
+            Self::RandomnessUnavailable => "randomness_unavailable",
+            Self::InvalidBindingContext => "invalid_binding_context",
+            Self::RegistryUnavailable => "registry_unavailable",
+            Self::RegistryCapacityExhausted => "registry_capacity_exhausted",
+        }
+    }
 }
 
 impl fmt::Display for L3bLoopbackError {
@@ -708,6 +716,19 @@ mod tests {
         BindingTokenRegistry, MAX_BINDING_RECORDS, is_allowed_upstream_ip,
         resolve_dns_with_deadline, verify_upstream,
     };
+
+    /// binding token 的 Debug 形状不得包含 bearer 或任何可关联 token 的摘要。
+    #[test]
+    fn binding_token_debug_is_fully_redacted() {
+        let registry = BindingTokenRegistry::default();
+        let token = registry
+            .register("scope-debug", 1, 1)
+            .expect("测试 binding 必须可注册");
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "BindingToken(<redacted>)");
+        assert!(!rendered.contains(&token.as_bearer()));
+        assert!(!rendered.contains("fingerprint"));
+    }
 
     /// binding registry 的 tombstone 必须在固定容量内回收，不能随 Channel/sidecar 轮换增长。
     #[test]

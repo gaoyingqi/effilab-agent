@@ -107,6 +107,36 @@ pub struct HostRuntime {
     restart_retry_scopes: Mutex<BTreeSet<String>>,
 }
 
+/// 简体中文注释：返回稳定的英文日志命令名，不读取命令中的 scope、session 或 prompt 内容。
+fn kit_command_name(command: &KitCommand) -> &'static str {
+    match command {
+        KitCommand::GetCapability => "get_capability",
+        KitCommand::Send { .. } => "send",
+        KitCommand::Cancel { .. } => "cancel",
+        KitCommand::NewSession { .. } => "new_session",
+        KitCommand::ListSessions { .. } => "list_sessions",
+        KitCommand::ResumeSession { .. } => "resume_session",
+        KitCommand::DeleteSession { .. } => "delete_session",
+        KitCommand::GetLlmChannelView => "get_llm_channel_view",
+        KitCommand::SetLlmChannel { .. } => "set_llm_channel",
+        KitCommand::Unknown { .. } => "unknown",
+    }
+}
+
+/// 简体中文注释：返回回复的英文类型名，日志不记录回复内容。
+fn kit_reply_kind(reply: &KitReply) -> &'static str {
+    match reply {
+        KitReply::Capability(_) => "capability",
+        KitReply::Send { .. } => "send",
+        KitReply::Cancel { .. } => "cancel",
+        KitReply::NewSession { .. } => "new_session",
+        KitReply::ListSessions { .. } => "list_sessions",
+        KitReply::ResumeSession { .. } => "resume_session",
+        KitReply::DeleteSession { .. } => "delete_session",
+        KitReply::LlmChannelView { .. } => "llm_channel_view",
+    }
+}
+
 impl HostRuntime {
     /// 构造进程内单例运行时；实际 L3b 监听和 sidecar spawn 均延迟到对话命令。
     pub fn new(
@@ -148,7 +178,15 @@ impl HostRuntime {
         load_timeout: Duration,
     ) -> Self {
         let app = Arc::new(app);
+        log::info!("Agent Kit lifecycle stage=channel_initialization started");
         let channel = LlmChannelService::new(Arc::clone(&app), cfg.clone()).map(Arc::new);
+        match &channel {
+            Ok(_) => log::info!("Agent Kit lifecycle stage=channel_initialization completed"),
+            Err(error) => log::error!(
+                "Agent Kit lifecycle stage=channel_initialization failed error_code={}",
+                error.code()
+            ),
+        }
         let app: Arc<dyn HostApp> = app;
         let sink: Arc<dyn KitEventSink> = Arc::new(ValidatedKitEventSink::new(sink));
 
@@ -169,7 +207,10 @@ impl HostRuntime {
 
     /// 分派 Kit 命令，并严格遵守各命令的 ACP 回执时机。
     pub fn dispatch(&self, cmd: KitCommand) -> Result<KitReply, KitError> {
-        match cmd {
+        let command_name = kit_command_name(&cmd);
+        let started_at = Instant::now();
+        log::info!("Host Agent Kit dispatch started command={command_name}");
+        let result = match cmd {
             KitCommand::GetCapability => self.dispatch_get_capability(),
             KitCommand::Send {
                 scope_id,
@@ -253,7 +294,20 @@ impl HostRuntime {
                 "unsupported",
                 "当前 Host 不支持该 Kit 命令",
             )),
+        };
+        let elapsed_ms = started_at.elapsed().as_millis();
+        match &result {
+            Ok(reply) => log::info!(
+                "Host Agent Kit dispatch completed command={command_name} reply_kind={} elapsed_ms={elapsed_ms}",
+                kit_reply_kind(reply)
+            ),
+            Err(error) => log::error!(
+                "Host Agent Kit dispatch failed command={command_name} error_code={} retryable={} elapsed_ms={elapsed_ms}",
+                error.code,
+                error.retryable
+            ),
         }
+        result
     }
 
     /// GetCapability 只读本地 committed view；平台 capability 不可用优先于无 Channel 返回。
@@ -586,6 +640,18 @@ impl HostRuntime {
             .map_err(|_| KitError::non_retryable("sidecar_unavailable", "通道事务不可用"))?;
         // 新命令触发旧 actor cleanup 时，先重试跨线程保留的 terminal event。
         self.retry_terminal_outbox()?;
+        let restart_failed = self
+            .restart_retry_scopes
+            .lock()
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
+            .contains(scope_id);
+        if restart_failed {
+            tracing::debug!(
+                scope = %scope_id,
+                "scope remains unavailable after channel restart; automatic recovery is blocked"
+            );
+            return Err(LlmChannelError::RestartFailed.as_kit_error());
+        }
         let previous = {
             let actors = self.actors.lock().map_err(|_| {
                 KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
@@ -636,14 +702,40 @@ impl HostRuntime {
     /// 构造并启动 actor；真实 sidecar spawn 顺序只能经 LlmChannelService 进入。
     fn spawn_actor(&self, scope_id: &str) -> Result<Arc<ActorHandle>, KitError> {
         let service = self.channel_service()?;
-        let approved_mcp = self
-            .app
-            .mcp_for_scope(&ScopeId(scope_id.to_string()))
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "MCP 批准规格不可用"))?;
-        tracing::debug!(scope = %scope_id, "正在启动 scope ACP IO actor");
-        let launched = service
-            .launch_scope_with_stdio(scope_id, &approved_mcp)
-            .map_err(channel_error)?;
+        log::info!("Host Agent Kit lifecycle stage=mcp_spec started");
+        let approved_mcp = match self.app.mcp_for_scope(&ScopeId(scope_id.to_string())) {
+            Ok(spec) => {
+                log::info!("Host Agent Kit lifecycle stage=mcp_spec completed");
+                spec
+            }
+            Err(_) => {
+                log::error!(
+                    "Host Agent Kit lifecycle stage=mcp_spec failed error_code=mcp_spec_unavailable"
+                );
+                return Err(KitError::non_retryable(
+                    "sidecar_unavailable",
+                    "MCP 批准规格不可用",
+                ));
+            }
+        };
+        log::info!("Host Agent Kit lifecycle stage=launch_scope_with_stdio started");
+        let launched = match service.launch_scope_with_stdio(scope_id, &approved_mcp) {
+            Ok(launched) => {
+                log::info!(
+                    "Host Agent Kit lifecycle stage=launch_scope_with_stdio completed generation={} sidecar_pid={}",
+                    launched.info.generation,
+                    launched.info.pid
+                );
+                launched
+            }
+            Err(error) => {
+                log::error!(
+                    "Host Agent Kit lifecycle stage=launch_scope_with_stdio failed error_code={}",
+                    error.code()
+                );
+                return Err(channel_error(error));
+            }
+        };
         tracing::debug!(
             scope = %scope_id,
             generation = launched.info.generation,
@@ -653,6 +745,11 @@ impl HostRuntime {
         let policy = match host_policy(&launched) {
             Ok(policy) => policy,
             Err(error) => {
+                log::error!(
+                    "Host Agent Kit lifecycle stage=host_policy failed error_code={} retryable={}",
+                    error.code,
+                    error.retryable
+                );
                 // policy 失败时 stdio 即将关闭；同时让 Supervisor 立即回收已注册的 child/token。
                 if service.stop_scope(scope_id).is_err() {
                     tracing::error!(
@@ -696,12 +793,19 @@ impl HostRuntime {
         );
         let name = format!("efflab-acp-{}", scope_id);
         let actor_finished = Arc::clone(&finished);
+        log::info!("Host Agent Kit lifecycle stage=acp_actor_thread started");
         let join = match thread::Builder::new().name(name).spawn(move || {
             actor.run();
             actor_finished.store(true, Ordering::Release);
         }) {
-            Ok(join) => join,
+            Ok(join) => {
+                log::info!("Host Agent Kit lifecycle stage=acp_actor_thread completed");
+                join
+            }
             Err(_) => {
+                log::error!(
+                    "Host Agent Kit lifecycle stage=acp_actor_thread failed error_code=thread_spawn_failed"
+                );
                 // closure 被释放时 AcpRuntime 会关闭 stdin；再显式回收 child，不能遗留 token。
                 if service.stop_scope(scope_id).is_err() {
                     tracing::error!(
@@ -1663,6 +1767,9 @@ impl ScopeActor {
                 continue;
             }
             if !self.initialized && Instant::now() >= self.initialize_deadline {
+                log::error!(
+                    "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_timeout"
+                );
                 self.enter_dead(sidecar_unavailable("sidecar initialize 超时"));
                 continue;
             }
@@ -1708,21 +1815,27 @@ impl ScopeActor {
 
     /// 初始化请求在 actor 内发送，使整个 stdin 生命周期严格单线程拥有。
     fn begin_initialize(&mut self) -> Result<(), KitError> {
-        let id = self
-            .acp
-            .request_validated(
-                "initialize",
-                json!({
-                    "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false,
-                    },
-                    "clientInfo": { "name": "efflab-agent-host", "version": env!("CARGO_PKG_VERSION") },
-                }),
-                &self.policy,
-            )
-            .map_err(|_| sidecar_unavailable("无法写入 sidecar initialize"))?;
+        log::info!("Host Agent Kit lifecycle stage=acp_initialize started");
+        let id = match self.acp.request_validated(
+            "initialize",
+            json!({
+                "protocolVersion": HOST_ACP_PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false,
+                },
+                "clientInfo": { "name": "efflab-agent-host", "version": env!("CARGO_PKG_VERSION") },
+            }),
+            &self.policy,
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                log::error!(
+                    "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_write_failed"
+                );
+                return Err(sidecar_unavailable("无法写入 sidecar initialize"));
+            }
+        };
         self.initialize_id = Some(id);
         Ok(())
     }
@@ -1758,6 +1871,9 @@ impl ScopeActor {
                 }
                 Ok(None) => return true,
                 Err(_) => {
+                    log::error!(
+                        "Host Agent Kit lifecycle stage=acp_transport failed error_code=reader_terminated"
+                    );
                     // transport 终止时统一结算 load、active turn 和其它 pending。
                     self.finish_transport_death();
                     self.enter_dead(sidecar_unavailable("sidecar stdio 已终止"));
@@ -1791,6 +1907,7 @@ impl ScopeActor {
             self.initialize_id = None;
             match result {
                 Ok(result) if validate_initialize_result(&result) => {
+                    log::info!("Host Agent Kit lifecycle stage=acp_initialize completed");
                     tracing::debug!(
                         scope = %self.scope_id,
                         event = "sidecar_initialize_validated",
@@ -1808,6 +1925,9 @@ impl ScopeActor {
                     }
                 }
                 Ok(_) => {
+                    log::error!(
+                        "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_result_rejected"
+                    );
                     tracing::debug!(
                         scope = %self.scope_id,
                         event = "sidecar_initialize_rejected",
@@ -1815,7 +1935,12 @@ impl ScopeActor {
                     );
                     self.enter_dead(sidecar_unavailable("sidecar initialize 握手不受支持"));
                 }
-                Err(_) => self.enter_dead(sidecar_unavailable("sidecar initialize 被拒绝")),
+                Err(_) => {
+                    log::error!(
+                        "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_rpc_rejected"
+                    );
+                    self.enter_dead(sidecar_unavailable("sidecar initialize 被拒绝"));
+                }
             }
             return;
         }
@@ -3326,6 +3451,11 @@ impl ScopeActor {
         if self.dead {
             return;
         }
+        log::error!(
+            "Host Agent Kit lifecycle stage=actor_dead error_code={} retryable={}",
+            error.code,
+            error.retryable
+        );
         self.stop_accepting();
         self.dead = true;
         // ScopeDead 结算必须发生在 ACP shutdown 前，确保 accepted resume 有终止事件。
@@ -3973,6 +4103,167 @@ fn send_reply(session_id: &str, submission_id: &str, duplicate: bool) -> KitRepl
         session_id: session_id.to_string(),
         turn_id: submission_id.to_string(),
         submission_id: submission_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod logging_contract_tests {
+    /// 关键启动阶段必须有可检索的英文日志，且日志契约不能依赖 tracing subscriber 已经存在。
+    #[test]
+    fn host_runtime_contains_dispatch_and_lifecycle_log_boundaries() {
+        let runtime_source = include_str!("runtime.rs");
+        for marker in [
+            "Host Agent Kit dispatch started",
+            "Host Agent Kit dispatch completed",
+            "Host Agent Kit dispatch failed",
+            "stage=mcp_spec",
+            "stage=launch_scope_with_stdio",
+            "stage=sidecar_spawn",
+            "stage=acp_initialize",
+            "stage=acp_transport",
+            "stage=actor_dead",
+        ] {
+            assert!(
+                runtime_source.contains(marker),
+                "Host 日志契约缺少阶段标记: {marker}"
+            );
+        }
+        for parts in [
+            ["prompt", "=", "{"],
+            ["api_key", "=", "{"],
+            ["token", "=", "{"],
+            ["payload", "=", "{"],
+        ] {
+            let forbidden = parts.concat();
+            assert!(
+                !runtime_source.contains(&forbidden),
+                "Host 日志不得记录敏感载荷: {forbidden}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod restart_gate_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::Result;
+
+    use super::*;
+    use crate::app_port::{
+        ApprovedMcpSpec, HostApp, LlmChannelConfig, LlmSecretSlot, ScopeId, SealedSecret,
+        SecretGuard,
+    };
+    use crate::config::L3bRuntimeConfig;
+    use crate::event_sink::KitEventSink;
+
+    /// 记录 MCP 规格查询次数；如果普通命令越过 tombstone，就会触发该计数。
+    struct RestartGateTestApp {
+        mcp_calls: Arc<AtomicUsize>,
+    }
+
+    impl HostApp for RestartGateTestApp {
+        fn app_id(&self) -> &str {
+            "restart-gate-test"
+        }
+
+        fn persist_llm_channel(&self, _config: &LlmChannelConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn load_llm_channel(&self) -> Result<LlmChannelConfig> {
+            Ok(LlmChannelConfig::Byok {
+                base_url: "https://8.8.8.8/v1".to_string(),
+                model_id: "restart-gate-test-model".to_string(),
+                api_key: SealedSecret::new(b"test-key".to_vec()),
+            })
+        }
+
+        fn seal_secret(&self, plain: &[u8]) -> Result<SealedSecret> {
+            Ok(SealedSecret::new(plain.to_vec()))
+        }
+
+        fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard> {
+            Ok(SecretGuard::new(sealed.as_bytes().to_vec()))
+        }
+
+        fn seal_llm_secret(
+            &self,
+            _slot: LlmSecretSlot,
+            plain: &[u8],
+        ) -> Result<SealedSecret> {
+            self.seal_secret(plain)
+        }
+
+        fn unseal_llm_secret(
+            &self,
+            _slot: LlmSecretSlot,
+            sealed: &SealedSecret,
+        ) -> Result<SecretGuard> {
+            self.unseal_secret(sealed)
+        }
+
+        fn mcp_for_scope(&self, _scope: &ScopeId) -> Result<ApprovedMcpSpec> {
+            self.mcp_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(ApprovedMcpSpec::default())
+        }
+    }
+
+    struct NoopSink;
+
+    impl KitEventSink for NoopSink {
+        fn emit(&self, _event: KitProductEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 已记录 restart 失败的 scope 必须拒绝普通命令，不得自动再次启动 sidecar。
+    #[test]
+    fn restart_failed_scope_rejects_normal_command_without_respawn() {
+        let temporary = tempfile::tempdir().expect("必须能创建 restart gate 测试目录");
+        let mcp_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = HostRuntime::new(
+            RestartGateTestApp {
+                mcp_calls: Arc::clone(&mcp_calls),
+            },
+            NoopSink,
+            crate::HostRuntimeConfig {
+                home_root: temporary.path().join("app-data"),
+                sidecar_bin: temporary.path().join("must-not-spawn"),
+                sidecar_log_path: temporary.path().join("sidecar.log"),
+                mcp_exec_root: temporary.path().join("mcp"),
+                idle_after: Duration::from_secs(60),
+                l3b: L3bRuntimeConfig::default(),
+                system_prompt: String::new(),
+            },
+        );
+        runtime
+            .restart_retry_scopes
+            .lock()
+            .expect("restart gate 锁必须可用")
+            .insert("scope-a".to_string());
+
+        let error = match runtime.dispatch(KitCommand::NewSession {
+            scope_id: "scope-a".to_string(),
+            client_request_id: None,
+        }) {
+            Ok(_) => panic!("restart 失败 scope 的普通命令不得成功"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "sidecar_unavailable");
+        assert!(!error.retryable, "restart 失败必须保留重启应用协议");
+        assert_eq!(
+            error.message,
+            "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试"
+        );
+        assert_eq!(
+            mcp_calls.load(Ordering::Acquire),
+            0,
+            "普通命令不得越过 restart tombstone 进入 MCP/sidecar 启动路径"
+        );
     }
 }
 

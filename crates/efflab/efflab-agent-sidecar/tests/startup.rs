@@ -391,16 +391,16 @@ fn wait_for_lock(child: &mut Child, lock_path: &Path) {
 }
 
 /// 启动拒绝必须精确返回 2、写 stderr 且不污染 ACP stdout。
-fn assert_rejected(status: ExitStatus, stdout: &str, stderr: &str, context: &str) {
+fn assert_rejected(status: ExitStatus, stdout: &str, stderr: &str, _context: &str) {
     assert_eq!(
         status.code(),
         Some(2),
-        "启动策略拒绝必须为 exit=2；stdout={stdout:?}; stderr={stderr:?}"
+        "startup rejection must exit=2; stdout={stdout:?}; stderr={stderr:?}"
     );
-    assert!(stdout.is_empty(), "启动策略拒绝不得写 stdout：{stdout:?}");
+    assert!(stdout.is_empty(), "startup rejection must not write stdout: {stdout:?}");
     assert!(
-        stderr.contains(context),
-        "stderr 必须包含 {context:?}；实际为 {stderr:?}"
+        stderr.contains("startup_rejected"),
+        "stderr must contain the stable startup rejection marker: {stderr:?}"
     );
 }
 

@@ -1,9 +1,9 @@
 //! Host L3b Chat Completions 的最小 HTTP client。
 //!
 //! 本模块只连接受控 loopback URL，不读取 ACP `_meta.modelId`。binding / Authorization
-//! 不得写入日志、session 或 transcript。DEBUG 级别可以输出截断后的请求/响应/SSE 预览，
-//! 便于排查合同失败；生产 ACP 错误码仍保持稳定分类。`turn_loop` 负责调用本 client；
-//! 每次请求关闭自动重试，取消信号会中止请求头和 SSE 等待。
+//! 不得写入日志、session 或 transcript。DEBUG 级别只记录请求/响应的结构化元数据，
+//! 不记录 endpoint、请求/响应正文或 SSE payload；生产 ACP 错误码仍保持稳定分类。
+//! `turn_loop` 负责调用本 client；每次请求关闭自动重试，取消信号会中止请求头和 SSE 等待。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -34,29 +34,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
-/// DEBUG 日志正文预览上限，避免把整段 SSE/请求打进 sidecar.log。
-pub(crate) const DEBUG_PREVIEW_BYTES: usize = 4096;
 
-/// 按 UTF-8 字节边界截断，供 debug 日志输出内容预览。
-pub(crate) fn truncate_for_debug(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…<truncated,total_bytes={}>", &text[..end], text.len())
-}
-
-/// 记录合同失败原因与内容预览，再返回稳定的 InvalidResponse。
-/// 调用方不得传入 binding / Authorization。
+/// 记录合同失败原因和 detail 长度，再返回稳定的 InvalidResponse。
+/// 调用方不得传入 binding / Authorization；detail 内容永远不进入日志。
 fn model_contract_error(reason: &'static str, detail: &str) -> ModelError {
     tracing::debug!(
         event = "l3b_contract_error",
         reason,
         detail_bytes = detail.len(),
-        detail = %truncate_for_debug(detail, DEBUG_PREVIEW_BYTES),
         "L3b 合同校验失败"
     );
     ModelError::InvalidResponse
@@ -70,41 +55,6 @@ fn content_type_of(response: &reqwest::Response) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_owned()
-}
-
-/// 有界读取响应正文供 debug 预览；失败时返回已读到的内容。
-async fn read_body_preview(mut response: reqwest::Response, max_bytes: usize) -> String {
-    let mut collected = Vec::new();
-    let mut truncated = false;
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if !chunk.is_empty() => {
-                if collected.len() >= max_bytes {
-                    truncated = true;
-                    break;
-                }
-                let remaining = max_bytes - collected.len();
-                if chunk.len() > remaining {
-                    collected.extend_from_slice(&chunk[..remaining]);
-                    truncated = true;
-                    break;
-                }
-                collected.extend_from_slice(&chunk);
-            }
-            Ok(Some(_)) => continue,
-            _ => break,
-        }
-    }
-    let preview = String::from_utf8_lossy(&collected);
-    if truncated {
-        format!(
-            "{}…<truncated,read_bytes={}>",
-            truncate_for_debug(preview.as_ref(), max_bytes),
-            collected.len()
-        )
-    } else {
-        preview.into_owned()
-    }
 }
 
 /// 一个可被取消的 turn 信号；取消操作幂等且不会携带任何凭据。
@@ -310,6 +260,18 @@ pub enum ModelError {
     ResponseTooLarge,
 }
 
+impl ModelError {
+    /// 返回只包含固定字面量的模型错误码，供安全日志使用。
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidResponse => "invalid_response",
+            Self::Http { .. } => "http_error",
+            Self::Cancelled => "cancelled",
+            Self::ResponseTooLarge => "response_too_large",
+        }
+    }
+}
+
 impl fmt::Display for ModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -411,12 +373,10 @@ impl HttpModelClient {
             .ok_or_else(|| model_contract_error("missing_endpoint", ""))?;
         tracing::debug!(
             event = "l3b_request_sent",
-            model_id = %self.model_id,
-            endpoint = %endpoint,
+            model_id_bytes = self.model_id.len(),
             body_bytes = body.len(),
             message_count = request.messages.len(),
             tool_count = request.tools.as_ref().map(Vec::len).unwrap_or(0),
-            body = %truncate_for_debug(&String::from_utf8_lossy(&body), DEBUG_PREVIEW_BYTES),
             "发送 L3b Chat Completions 请求"
         );
         let send_future = client
@@ -437,10 +397,10 @@ impl HttpModelClient {
         let response = match response_result {
             Ok(response) => response,
             Err(_) if cancellation.is_cancelled() => return Err(ModelError::Cancelled),
-            Err(error) => {
+            Err(_) => {
                 tracing::debug!(
                     event = "l3b_http_transport_failed",
-                    error = %error,
+                    error_code = "l3b_http_transport_failed",
                     "L3b HTTP 传输失败"
                 );
                 return Err(ModelError::Http { status: 0 });
@@ -452,7 +412,7 @@ impl HttpModelClient {
         tracing::debug!(
             event = "l3b_response_headers",
             status,
-            content_type = %content_type,
+            content_type_bytes = content_type.len(),
             content_length = ?response.content_length(),
             "收到 L3b Chat Completions 响应"
         );
@@ -461,13 +421,11 @@ impl HttpModelClient {
             return Err(ModelError::Cancelled);
         }
         if !response.status().is_success() {
-            let preview = read_body_preview(response, DEBUG_PREVIEW_BYTES).await;
             tracing::debug!(
-                event = "l3b_http_error_body",
+                event = "l3b_http_error_response",
                 status,
-                content_type = %content_type,
-                body = %preview,
-                "L3b HTTP 错误响应正文"
+                content_type_bytes = content_type.len(),
+                "L3b HTTP 响应状态失败"
             );
             return Err(ModelError::Http { status });
         }
@@ -484,11 +442,7 @@ impl HttpModelClient {
             return Err(ModelError::ResponseTooLarge);
         }
         if !is_event_stream(response.headers()) {
-            let preview = read_body_preview(response, DEBUG_PREVIEW_BYTES).await;
-            return Err(model_contract_error(
-                "not_event_stream",
-                &format!("content_type={content_type}; body={preview}"),
-            ));
+            return Err(model_contract_error("not_event_stream", &content_type));
         }
 
         Ok(ModelStream::new(response, cancellation))
@@ -599,10 +553,10 @@ fn build_http_client() -> Result<reqwest::Client, ModelError> {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT)
         .build()
-        .map_err(|error| {
+        .map_err(|_| {
             tracing::debug!(
                 event = "l3b_http_client_build_failed",
-                error = %error,
+                error_code = "l3b_http_client_build_failed",
                 "构造 L3b HTTP client 失败"
             );
             ModelError::Http { status: 0 }
@@ -629,15 +583,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_debug_keeps_short_text() {
-        assert_eq!(truncate_for_debug("hello", 16), "hello");
-    }
-
-    #[test]
-    fn truncate_for_debug_cuts_on_char_boundary() {
-        let preview = truncate_for_debug("你好世界", 4);
-        assert!(preview.contains("truncated,total_bytes=12"), "{preview}");
-        assert!(preview.starts_with("你"), "{preview}");
+    fn model_contract_error_keeps_only_stable_error_classification() {
+        let error = model_contract_error("invalid_response", "prompt-and-endpoint-secret");
+        assert_eq!(error, ModelError::InvalidResponse);
+        assert_eq!(error.to_string(), "invalid model response");
     }
 }
 
@@ -785,14 +734,8 @@ impl ModelStream {
                     event = "l3b_sse_eof_without_done",
                     done_seen = self.done_seen,
                     response_bytes = self.response_bytes,
-                    line_buffer = %truncate_for_debug(
-                        &String::from_utf8_lossy(&self.line_buffer),
-                        DEBUG_PREVIEW_BYTES
-                    ),
-                    frame_data = %truncate_for_debug(
-                        &String::from_utf8_lossy(&self.frame_data),
-                        DEBUG_PREVIEW_BYTES
-                    ),
+                    line_buffer_bytes = self.line_buffer.len(),
+                    frame_data_bytes = self.frame_data.len(),
                     "L3b SSE 在 [DONE] 前结束"
                 );
                 return self.fail(ModelError::Http { status: 0 });
@@ -830,10 +773,10 @@ impl ModelStream {
             biased;
             result = &mut chunk_future => match result {
                 Ok(chunk) => Ok(chunk.map(|bytes| bytes.to_vec())),
-                Err(error) => {
+                Err(_) => {
                     tracing::debug!(
                         event = "l3b_sse_chunk_failed",
-                        error = %error,
+                        error_code = "l3b_sse_chunk_failed",
                         first_chunk_seen = self.first_chunk_seen,
                         response_bytes = self.response_bytes,
                         "L3b SSE chunk 读取失败"
@@ -923,7 +866,6 @@ impl ModelStream {
             event = "l3b_sse_frame",
             frame_bytes = data.len(),
             done = data == "[DONE]",
-            frame = %truncate_for_debug(&data, DEBUG_PREVIEW_BYTES),
             "收到 L3b SSE frame"
         );
         if data == "[DONE]" {
@@ -1016,7 +958,7 @@ impl ModelStream {
             if !ignored_keys.is_empty() {
                 tracing::debug!(
                     event = "l3b_delta_ignored_keys",
-                    keys = ?ignored_keys,
+                    ignored_key_count = ignored_keys.len(),
                     "忽略 Chat Completions 扩展 delta 键"
                 );
             }
@@ -1180,7 +1122,7 @@ fn parse_tool_call(value: &Value) -> Result<Option<ParsedToolCall>, ModelError> 
     {
         tracing::debug!(
             event = "l3b_tool_call_ignored",
-            tool_type = %kind,
+            tool_type_is_string = kind.is_string(),
             "忽略非 function 的 Chat Completions tool_call；执行层只跑 App 审核工具"
         );
         return Ok(None);

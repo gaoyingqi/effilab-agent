@@ -26,7 +26,7 @@ Windows 发布版能找到 `efflab-agent-sidecar.exe`，但 Host 的 `supervisor
 ## 边界与未验证项
 
 - 必须在产品 release 重建后重新验证 `app.exe` 实际加载的是包含本次 Host 修复的版本。
-- 需要重新确认用户启动 Agent Kit 后生成 `{app_log_dir}/agent-kit/sidecar.log`，并检查日志不含 API key、token 或 Authorization 值。
+- 需要重新确认用户启动 Agent Kit 后生成与 `app.log` 同级的 `{app_log_dir}/sidecar.log`，并检查日志不含 API key、token 或 Authorization 值。
 - Authenticode 签名、MSIX 安装、真实商店安装和真实 BYOK 仍未在本条记录中证明。
 - 若 Windows 真实启动链路失败，回滚 `capability()` 为 `Unavailable { reason: SidecarHardeningUnavailable }`，并恢复旧回归断言。
 

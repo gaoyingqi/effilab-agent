@@ -15,11 +15,13 @@ use efflab_agent_host::{
 
 /// 构造仅供协议测试使用的运行时配置；骨架阶段不会访问这些路径。
 fn runtime_config() -> HostRuntimeConfig {
+    // 简体中文注释：使用当前平台的临时目录，避免 Windows 将 POSIX `/tmp` 判定为相对路径。
+    let root = std::env::temp_dir().join("efflab-agent-host-test");
     HostRuntimeConfig {
-        home_root: PathBuf::from("/tmp/efflab-agent-host-test/home"),
-        sidecar_bin: PathBuf::from("/tmp/efflab-agent-host-test/sidecar"),
-        sidecar_log_path: PathBuf::from("/tmp/efflab-agent-host-test/sidecar.log"),
-        mcp_exec_root: PathBuf::from("/tmp/efflab-agent-host-test/mcp"),
+        home_root: root.join("home"),
+        sidecar_bin: root.join("sidecar"),
+        sidecar_log_path: root.join("sidecar.log"),
+        mcp_exec_root: root.join("mcp"),
         idle_after: Duration::from_secs(60),
         l3b: efflab_agent_host::L3bRuntimeConfig::default(),
         system_prompt: String::new(),

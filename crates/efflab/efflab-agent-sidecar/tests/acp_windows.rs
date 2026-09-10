@@ -90,6 +90,11 @@ impl ModelServer {
         format!("http://{}/v1", self.address)
     }
 
+    /// 返回 sidecar 实际使用的 Chat Completions endpoint，供日志脱敏回归断言使用。
+    fn endpoint(&self) -> String {
+        format!("http://{}/v1/chat/completions", self.address)
+    }
+
     /// 等待 sidecar 发出模型请求。
     fn wait_for_request(&self) {
         let deadline = Instant::now() + EXIT_TIMEOUT;
@@ -293,8 +298,8 @@ impl TestProcess {
         )
     }
 
-    /// 关闭 stdin，等待正常 EOF；超时则强制回收并让断言失败。
-    fn finish(&mut self, client: &mut AcpClient) {
+    /// 关闭 stdin，等待正常 EOF，并返回 sidecar stderr 供日志合同断言使用。
+    fn finish(&mut self, client: &mut AcpClient) -> String {
         client.close_stdin();
         let deadline = Instant::now() + EXIT_TIMEOUT;
         let status = loop {
@@ -320,6 +325,7 @@ impl TestProcess {
             "Windows sidecar ACP 回合应正常退出：status={status:?}; stderr={:?}",
             String::from_utf8_lossy(&stderr)
         );
+        String::from_utf8_lossy(&stderr).into_owned()
     }
 }
 
@@ -408,7 +414,65 @@ fn windows_sidecar_completes_minimal_acp_round_trip() {
     model.wait_for_request();
     assert_eq!(model.authorization_values(), [format!("Bearer {L3B_BIND}")]);
     assert_jsonrpc_lines(&client.raw_lines());
-    process.finish(&mut client);
+    let _ = process.finish(&mut client);
+}
+
+#[test]
+fn windows_sidecar_stderr_excludes_prompt_endpoint_and_model_payloads() {
+    let model = ModelServer::start();
+    let fixture = Fixture::new(model.base_url());
+    let (mut process, mut client) = TestProcess::spawn(&fixture);
+    let _ = client
+        .request("initialize", initialize_params(), REQUEST_TIMEOUT)
+        .expect("Windows sidecar initialize 必须成功");
+    let session = client
+        .request(
+            "session/new",
+            serde_json::json!({
+                "cwd": fixture.session_cwd,
+                "mcpServers": []
+            }),
+            REQUEST_TIMEOUT,
+        )
+        .expect("Windows sidecar session/new 必须成功");
+    let session_id = session["result"]["sessionId"]
+        .as_str()
+        .expect("Windows session/new 必须返回 sessionId")
+        .to_owned();
+    let prompt_secret = "windows-log-prompt-secret";
+    let response_secret = "windows response";
+    let response = client
+        .request(
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt_secret}],
+                "_meta": {"promptId": "windows-log-redaction"}
+            }),
+            REQUEST_TIMEOUT,
+        )
+        .expect("Windows sidecar session/prompt 必须成功");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    model.wait_for_request();
+
+    let stderr = process.finish(&mut client);
+    for forbidden in [
+        prompt_secret,
+        response_secret,
+        L3B_BIND,
+        &model.endpoint(),
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "sidecar stderr 不得包含敏感或正文内容 {forbidden:?}: {stderr:?}"
+        );
+    }
+    for forbidden_field in ["payload=", "user_text=", "assistant_text=", "endpoint="] {
+        assert!(
+            !stderr.contains(forbidden_field),
+            "sidecar stderr 不得包含正文日志字段 {forbidden_field:?}: {stderr:?}"
+        );
+    }
 }
 
 // 保持 Path 在 Windows 条件代码中明确可见，避免未来扩展 fixture 时误用字符串路径。

@@ -1,7 +1,7 @@
 //! sidecar 启动所需的私有 home、文件权限和环境边界硬化。
 //!
-//! 本模块只在 Unix 上开放启动能力。Windows/非 Unix 的等价权限与进程边界尚未
-//! proven，因此直接返回 fail-closed 错误，不读取 runtime config 或创建目录。
+//! 本模块在 Unix 和 Windows 上使用各自已验证的目录、文件和进程边界原语；其它平台
+//! 直接返回 fail-closed 错误，不读取 runtime config 或创建目录。
 
 use std::env;
 use std::ffi::OsString;
