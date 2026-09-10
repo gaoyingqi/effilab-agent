@@ -4145,8 +4145,8 @@ mod logging_contract_tests {
 
 #[cfg(test)]
 mod restart_gate_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use anyhow::Result;
@@ -4189,11 +4189,7 @@ mod restart_gate_tests {
             Ok(SecretGuard::new(sealed.as_bytes().to_vec()))
         }
 
-        fn seal_llm_secret(
-            &self,
-            _slot: LlmSecretSlot,
-            plain: &[u8],
-        ) -> Result<SealedSecret> {
+        fn seal_llm_secret(&self, _slot: LlmSecretSlot, plain: &[u8]) -> Result<SealedSecret> {
             self.seal_secret(plain)
         }
 

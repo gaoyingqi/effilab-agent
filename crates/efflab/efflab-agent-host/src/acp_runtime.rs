@@ -1524,7 +1524,7 @@ mod wire_log_tests {
             !source.contains(&forbidden),
             "ACP transport 日志不得记录原始 error 字段: {forbidden}"
         );
-        let forbidden_drop = ["eprintln!", "(\"ACP runtime shutdown 失败: {error}"] .concat();
+        let forbidden_drop = ["eprintln!", "(\"ACP runtime shutdown 失败: {error}"].concat();
         assert!(
             !source.contains(&forbidden_drop),
             "ACP runtime Drop 不得输出底层 shutdown 错误: {forbidden_drop}"

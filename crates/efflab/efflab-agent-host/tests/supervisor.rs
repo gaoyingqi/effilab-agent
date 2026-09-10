@@ -1262,7 +1262,10 @@ fn windows_reports_available_and_keeps_kill_api_compilable() {
         .acquire("scope")
         .expect("Windows supervisor 必须允许取得 scope slot");
     assert_eq!(
-        slot.paths().workspace.file_name().and_then(|name| name.to_str()),
+        slot.paths()
+            .workspace
+            .file_name()
+            .and_then(|name| name.to_str()),
         Some("workspace")
     );
 

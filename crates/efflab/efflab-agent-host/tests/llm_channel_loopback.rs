@@ -759,9 +759,9 @@ fn http_native_ipv6_loopback_is_forwarded_when_development_flag_enabled() {
     upstream.join().expect("IPv6 上游线程必须退出");
 }
 
-/// SetLlmChannel 的空更新不可改变 committed view；端点、模型或类型变化必须带新 Key。
+/// SetLlmChannel 的空更新不可改变 committed view；已有 Key 时可改 URL/model 并复用密封密文。
 #[test]
-fn channel_set_requires_new_secret_for_identity_changes_and_allows_key_rotation() {
+fn channel_set_reuses_secret_for_identity_changes_and_allows_key_rotation() {
     let app = Arc::new(FakeApp::byok(
         "https://8.8.8.8/v1".to_string(),
         "model-a",
@@ -786,21 +786,62 @@ fn channel_set_requires_new_secret_for_identity_changes_and_allows_key_rotation(
     assert!(!same_kind.changed, "相同 kind 不得无故失效现有 token");
     assert_eq!(app.persist_calls.load(Ordering::SeqCst), 0);
 
-    let url_change = manager.set(SetLlmChannelRequest {
-        base_url: Some("https://1.1.1.1/v1".to_string()),
-        ..SetLlmChannelRequest::default()
-    });
-    assert!(url_change.is_err(), "更换 URL 但不提供新 Key 必须被拒绝");
-    assert_eq!(manager.revision(), revision, "失败不得更改 committed view");
-
-    let model_change = manager.set(SetLlmChannelRequest {
-        model_id: Some("model-b".to_string()),
-        ..SetLlmChannelRequest::default()
-    });
-    assert!(
-        model_change.is_err(),
-        "更换 model 但不提供新 Key 必须被拒绝"
+    let url_change = manager
+        .set(SetLlmChannelRequest {
+            base_url: Some("https://1.1.1.1/v1".to_string()),
+            ..SetLlmChannelRequest::default()
+        })
+        .expect("更换 URL 且省略 Key 必须复用已密封密文");
+    assert!(url_change.changed, "更换 URL 必须创建新 Channel revision");
+    assert_eq!(
+        url_change.view.base_url.as_deref(),
+        Some("https://1.1.1.1/v1")
     );
+    assert!(
+        url_change.view.key_present,
+        "复用密文后 view 仍应标记 Key 已配置"
+    );
+    assert_eq!(
+        app.seal_calls.load(Ordering::SeqCst),
+        0,
+        "省略 Key 时不得把明文交给密封端口"
+    );
+    match app.load_llm_channel().expect("测试配置必须可读") {
+        LlmChannelConfig::Byok {
+            base_url,
+            model_id,
+            api_key,
+        } => {
+            assert_eq!(base_url, "https://1.1.1.1/v1");
+            assert_eq!(model_id, "model-a");
+            assert_eq!(api_key.as_bytes(), b"original-test-key");
+        }
+        other => panic!("更换 URL 后必须仍是 BYOK，实际为 {other:?}"),
+    }
+
+    let model_change = manager
+        .set(SetLlmChannelRequest {
+            model_id: Some("model-b".to_string()),
+            ..SetLlmChannelRequest::default()
+        })
+        .expect("更换 model 且省略 Key 必须复用已密封密文");
+    assert!(
+        model_change.changed,
+        "更换 model 必须创建新 Channel revision"
+    );
+    assert_eq!(model_change.view.model_id.as_deref(), Some("model-b"));
+    match app.load_llm_channel().expect("测试配置必须可读") {
+        LlmChannelConfig::Byok {
+            base_url,
+            model_id,
+            api_key,
+        } => {
+            assert_eq!(base_url, "https://1.1.1.1/v1");
+            assert_eq!(model_id, "model-b");
+            assert_eq!(api_key.as_bytes(), b"original-test-key");
+        }
+        other => panic!("更换 model 后必须仍是 BYOK，实际为 {other:?}"),
+    }
 
     let kind_change = manager.set(SetLlmChannelRequest {
         kind: Some(LlmChannelKind::Relay),
@@ -819,7 +860,12 @@ fn channel_set_requires_new_secret_for_identity_changes_and_allows_key_rotation(
         "Key 轮换必须创建新 revision 使旧 token 失效"
     );
     assert!(manager.revision() > revision);
-    assert_eq!(app.persist_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(app.persist_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        app.seal_calls.load(Ordering::SeqCst),
+        1,
+        "只有显式轮换 Key 才应触发密封"
+    );
 }
 
 /// 初次写入无既有 Channel 可沿用，必须显式声明 BYOK 种类才允许密封和持久化。

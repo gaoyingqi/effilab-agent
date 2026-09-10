@@ -74,7 +74,6 @@ impl BindingToken {
     pub fn as_bearer(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.0)
     }
-
 }
 
 /// 仅在 registry 内保存的 token 与活动标志；不派生 Debug 以防遗漏脱敏。

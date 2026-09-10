@@ -501,7 +501,8 @@ impl LlmChannelManager {
         Ok(candidate)
     }
 
-    /// 更新既有 BYOK；仅 Key 轮换可省略 URL/model，任何身份变化都必须带新 Key。
+    /// 更新既有 BYOK；省略 `api_key` 时复用已密封密文，允许同时改 URL/model。
+    /// 首次配置仍必须带明文 Key；切 Relay 仍失败关闭。
     fn update_byok_config(
         &self,
         request: NormalizedSetRequest,
@@ -528,11 +529,8 @@ impl LlmChannelManager {
 
         let base_url = base_url.unwrap_or_else(|| current_base_url.clone());
         let model_id = model_id.unwrap_or_else(|| current_model_id.clone());
-        let identity_changed = base_url != current_base_url || model_id != current_model_id;
-        if identity_changed && api_key.is_none() {
-            return Err(LlmChannelError::InvalidRequest);
-        }
         // 与首次设置一致，先做无网络形状校验，再立即密封任何新明文 Key。
+        // 省略 api_key 时沿用已密封密文，避免设置页改 Endpoint/模型时被强迫重填。
         validate_byok_identity_shape(&base_url, &model_id, self.allow_loopback_llm)?;
         let api_key = match api_key {
             Some(plain_api_key) => self
