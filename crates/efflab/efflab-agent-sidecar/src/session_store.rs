@@ -1325,9 +1325,9 @@ impl SessionRepository {
         session_dir: &Path,
         file_name: &str,
     ) -> Result<bool, SessionError> {
-        let path = session_dir.join(file_name);
         #[cfg(windows)]
         if let Some(root) = &self.pinned_home {
+            let path = session_dir.join(file_name);
             let relative = self.pinned_relative_path(&path)?;
             return platform::path_entry_exists_relative(root, &relative)
                 .map_err(|_| SessionError::Io);
@@ -1627,6 +1627,19 @@ fn create_private_directory(path: &Path) -> Result<(), SessionError> {
     })?;
     set_private_directory_mode(path)?;
     verify_private_directory(path)
+}
+
+/// 新建目录后立即收紧为 0700；不修复预先存在的共享目录。
+#[cfg(unix)]
+fn set_private_directory_mode(path: &Path) -> Result<(), SessionError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).map_err(|_| {
+        tracing::debug!(
+            event = "session_directory_mode_set_failed",
+            "设置 session 目录 0700 权限失败"
+        );
+        SessionError::Io
+    })
 }
 
 #[cfg(unix)]
@@ -3603,6 +3616,19 @@ mod tests {
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("设置 home 权限");
         let repository = SessionRepository::new(&home);
         let session = repository.create().await.expect("创建 v1 session");
+        let session_dir = home
+            .join("efflab-sessions")
+            .join("v1")
+            .join(&session.id);
+        assert_eq!(
+            fs::symlink_metadata(&session_dir)
+                .expect("读取新建 session 目录元数据")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700,
+            "新建 session 目录必须是 0700"
+        );
         repository
             .delete(&session.id)
             .await
