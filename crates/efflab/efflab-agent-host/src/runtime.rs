@@ -2190,8 +2190,8 @@ impl ScopeActor {
             Ok(id) => {
                 self.pending.insert(id, PendingRpc::NewSession { reply });
             }
-            Err(_) => {
-                let _ = reply.send(Err(sidecar_unavailable("无法写入 session/new")));
+            Err(error) => {
+                reject_unwritable_session_request("session/new", error, reply);
                 self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
             }
         }
@@ -2214,8 +2214,8 @@ impl ScopeActor {
             Ok(id) => {
                 self.pending.insert(id, PendingRpc::ListSessions { reply });
             }
-            Err(_) => {
-                let _ = reply.send(Err(sidecar_unavailable("无法写入 session/list")));
+            Err(error) => {
+                reject_unwritable_session_request("session/list", error, reply);
                 self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
             }
         }
@@ -3856,6 +3856,19 @@ fn sidecar_unavailable(message: &str) -> KitError {
     }
 }
 
+/// 出站 session 请求未写入 stdin：用户只看到固定文案，日志不回显路径或错误链。
+fn reject_unwritable_session_request(method: &str, error: anyhow::Error, reply: ReplySender) {
+    let reason = if error.to_string().contains("Host contract") {
+        "host_contract"
+    } else {
+        "stdin_unavailable"
+    };
+    log::error!(
+        "Host Agent Kit lifecycle stage=acp_write failed method={method} error_code=sidecar_unavailable reason={reason}"
+    );
+    let _ = reply.send(Err(sidecar_unavailable(&format!("无法写入 {method}"))));
+}
+
 /// 只把明确的 ACP NotFound 错误码映射为 session_not_found。
 fn is_session_not_found(error: &RpcError) -> bool {
     error.code == ACP_SESSION_NOT_FOUND
@@ -4121,6 +4134,7 @@ mod logging_contract_tests {
             "stage=sidecar_spawn",
             "stage=acp_initialize",
             "stage=acp_transport",
+            "stage=acp_write",
             "stage=actor_dead",
         ] {
             assert!(

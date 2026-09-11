@@ -769,12 +769,15 @@ fn validate_meta_keys(
     Ok(())
 }
 
-/// cwd 匹配：canonical 化 Host 提供的 cwd 后与期望值精确比较。
+/// cwd 匹配：两侧都经 dunce 归一化后再精确比较。
+///
+/// Windows 上 `std::fs::canonicalize` 会留下 `\\?\` 前缀，dunce 会剥掉它。只归一化
+/// wire cwd、不归一化 expected_cwd，会把 Host 自己发出的合法路径判成 mismatch。
 fn cwd_matches(got: &Path, expected: &Path) -> bool {
-    match dunce::canonicalize(got) {
-        Ok(abs) => abs == expected,
+    match (dunce::canonicalize(got), dunce::canonicalize(expected)) {
+        (Ok(got), Ok(expected)) => got == expected,
         // canonicalize 失败（路径不存在等）→ 不匹配（fail-closed）。
-        Err(_) => false,
+        _ => false,
     }
 }
 
@@ -1635,5 +1638,37 @@ mod tests {
                 "用例 {name} 应被精确拒绝"
             );
         }
+    }
+
+    /// Host 用 `std::fs::canonicalize` 构造 expected_cwd 后，必须仍能接受同一路径的 wire cwd。
+    ///
+    /// Windows 上 canonicalize 会加上 `\\?\` 前缀，而 dunce 会剥掉它；只归一化一侧会把
+    /// 合法的 session/list 误判成 cwd mismatch，表现为「无法写入 session/list」。
+    #[test]
+    fn session_list_accepts_std_canonicalize_cwd_as_wire_value() {
+        let directory = TempDir::new().expect("必须能创建契约临时目录");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("临时 cwd 必须可 canonicalize");
+        let policy = policy_with(&canonical);
+        let params = serde_json::json!({
+            "cwd": canonical.display().to_string(),
+        });
+        assert!(
+            validate_host_request("session/list", &params, &policy).is_ok(),
+            "canonicalize 后的 expected_cwd 经 display 写回 session/list 必须自洽"
+        );
+        assert!(
+            validate_host_request(
+                "session/new",
+                &serde_json::json!({
+                    "cwd": canonical.display().to_string(),
+                    "mcpServers": [],
+                    "_meta": { "modelId": "byok" }
+                }),
+                &policy
+            )
+            .is_ok(),
+            "canonicalize 后的 expected_cwd 经 display 写回 session/new 必须自洽"
+        );
     }
 }
