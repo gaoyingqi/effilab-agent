@@ -1103,7 +1103,7 @@ fn channel_change_keeps_committed_view_when_live_scope_restart_fails() {
     );
     assert_eq!(
         kit_error.message,
-        "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试"
+        "LLM Channel saved, but the sidecar failed to restart; please restart the app and try again"
     );
     let view = service.view().expect("失败后仍必须可读取 committed view");
     assert_eq!(view.kind, Some(LlmChannelKind::Byok));

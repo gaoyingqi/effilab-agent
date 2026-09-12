@@ -66,17 +66,17 @@ const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
 /// Kit capability 与实际写入 sidecar 的单次 prompt 统一字符上限。
 const MAX_PROMPT_CHARS: usize = 32_000;
 /// 用户可见的回合失败提示；不得出现 sidecar 等实现名词。
-const TURN_FAILED_USER_MESSAGE: &str = "回复未完成，请重试";
+const TURN_FAILED_USER_MESSAGE: &str = "Reply did not complete; please retry";
 
 /// 把 sidecar 稳定错误码转成用户可读提示，不暴露内部实现名词。
 fn turn_failure_user_message(code: &str) -> &'static str {
     match code {
-        "turn_model_error" => "模型没有返回有效回复，请重试",
-        "turn_session_not_found" | "turn_session_read_only" => "当前会话无法继续，请新建对话",
-        "turn_session_error" => "会话保存失败，请重试",
-        "turn_transport_error" => "连接中断，请重试",
-        "turn_tool_rejected" => "这次工具调用未被允许",
-        "turn_permission_error" => "工具授权未完成，请重试",
+        "turn_model_error" => "The model did not return a valid reply; please retry",
+        "turn_session_not_found" | "turn_session_read_only" => "The current session cannot continue; please start a new conversation",
+        "turn_session_error" => "Failed to save the session; please retry",
+        "turn_transport_error" => "Connection interrupted; please retry",
+        "turn_tool_rejected" => "This tool call was not allowed",
+        "turn_permission_error" => "Tool authorization did not complete; please retry",
         _ => TURN_FAILED_USER_MESSAGE,
     }
 }
@@ -292,7 +292,7 @@ impl HostRuntime {
             }),
             KitCommand::Unknown { .. } => Err(KitError::non_retryable(
                 "unsupported",
-                "当前 Host 不支持该 Kit 命令",
+                "The current Host does not support this Kit command",
             )),
         };
         let elapsed_ms = started_at.elapsed().as_millis();
@@ -320,7 +320,7 @@ impl HostRuntime {
                 supervisor_capability,
                 SupervisorCapability::Unavailable { .. }
             ) {
-                return Err(sidecar_unavailable("当前平台不支持受硬化的 sidecar"));
+                return Err(sidecar_unavailable("The current platform does not support hardened sidecars"));
             }
             return Err(LlmChannelError::Unconfigured.as_kit_error());
         }
@@ -374,7 +374,7 @@ impl HostRuntime {
         let decision = self
             .submissions
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "提交映射不可用"))?
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Submission map is unavailable"))?
             // 指纹只依赖提交 wire 的原始 text 与排序后的 mention id，不能依赖可变展示文本。
             .record(&scope_id, &session_id, &submission_id, &text, &mentions);
 
@@ -388,7 +388,7 @@ impl HostRuntime {
             }),
             SubmissionDecision::FingerprintConflict => Err(KitError::non_retryable(
                 "fingerprint_conflict",
-                "同一 submission_id 的提交内容不一致",
+                "Submission content differs for the same submission_id",
             )),
             SubmissionDecision::Accepted { ticket, .. } => {
                 let actor = match self.actor_for_scope(&scope_id) {
@@ -463,7 +463,7 @@ impl HostRuntime {
         let _transition = self
             .channel_transition
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "通道事务不可用"))?;
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Channel transaction is unavailable"))?;
         // 先尝试交付此前 actor 退出后保留的终态，再决定是否允许本次换代继续。
         self.retry_terminal_outbox()?;
         let service = self.channel_service()?;
@@ -488,12 +488,12 @@ impl HostRuntime {
         let mut scopes = self
             .restart_retry_scopes
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable"))?
             .clone();
         // 只复制旧 actor；cleanup 失败时原句柄仍留在 map 作为 tombstone，禁止新代并存。
         let previous = {
             let actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
             })?;
             actors
                 .iter()
@@ -519,7 +519,7 @@ impl HostRuntime {
                 continue;
             }
             let mut actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
             })?;
             if actors
                 .get(&scope_id)
@@ -552,7 +552,7 @@ impl HostRuntime {
 
         let has_restart_failure = cleanup_failed || !restart_failed.is_empty();
         *self.restart_retry_scopes.lock().map_err(|_| {
-            KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用")
+            KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable")
         })? = restart_failed;
         if has_restart_failure {
             return Err(LlmChannelError::RestartFailed.as_kit_error());
@@ -567,7 +567,7 @@ impl HostRuntime {
         let scopes = self
             .restart_retry_scopes
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable"))?
             .clone();
         if scopes.is_empty() {
             return Ok(());
@@ -577,7 +577,7 @@ impl HostRuntime {
         for scope_id in scopes {
             let (already_recovered, previous) = {
                 let actors = self.actors.lock().map_err(|_| {
-                    KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                    KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
                 })?;
                 match actors.get(&scope_id) {
                     Some(actor) if actor.accepting.load(Ordering::Acquire) => (true, None),
@@ -596,7 +596,7 @@ impl HostRuntime {
                     continue;
                 }
                 let mut actors = self.actors.lock().map_err(|_| {
-                    KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                    KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
                 })?;
                 if actors
                     .get(&scope_id)
@@ -623,7 +623,7 @@ impl HostRuntime {
 
         let has_restart_failure = !remaining.is_empty();
         *self.restart_retry_scopes.lock().map_err(|_| {
-            KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用")
+            KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable")
         })? = remaining;
         if has_restart_failure {
             Err(LlmChannelError::RestartFailed.as_kit_error())
@@ -637,13 +637,13 @@ impl HostRuntime {
         let _transition = self
             .channel_transition
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "通道事务不可用"))?;
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Channel transaction is unavailable"))?;
         // 新命令触发旧 actor cleanup 时，先重试跨线程保留的 terminal event。
         self.retry_terminal_outbox()?;
         let restart_failed = self
             .restart_retry_scopes
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "restart 重试状态不可用"))?
+            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable"))?
             .contains(scope_id);
         if restart_failed {
             tracing::debug!(
@@ -654,7 +654,7 @@ impl HostRuntime {
         }
         let previous = {
             let actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
             })?;
             if let Some(actor) = actors.get(scope_id) {
                 if actor.restart_blocked.load(Ordering::Acquire) {
@@ -662,7 +662,7 @@ impl HostRuntime {
                         scope = %scope_id,
                         "scope 因 MCP 安全违例保持 tombstone，拒绝自动复活"
                     );
-                    return Err(sidecar_unavailable("scope 因 MCP 安全违例不可用"));
+                    return Err(sidecar_unavailable("Scope is unavailable due to an MCP safety violation"));
                 }
                 if actor.accepting.load(Ordering::Acquire) {
                     return Ok(Arc::clone(actor));
@@ -676,10 +676,10 @@ impl HostRuntime {
         if let Some(actor) = previous {
             let cleanup = actor.shutdown();
             if !cleanup.is_success() {
-                return Err(sidecar_unavailable("旧 scope cleanup 未完整完成"));
+                return Err(sidecar_unavailable("Previous scope cleanup did not complete"));
             }
             let mut actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
             })?;
             if actors
                 .get(scope_id)
@@ -693,7 +693,7 @@ impl HostRuntime {
         self.actors
             .lock()
             .map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
             })?
             .insert(scope_id.to_string(), Arc::clone(&actor));
         Ok(actor)
@@ -714,7 +714,7 @@ impl HostRuntime {
                 );
                 return Err(KitError::non_retryable(
                     "sidecar_unavailable",
-                    "MCP 批准规格不可用",
+                    "MCP approved spec is unavailable",
                 ));
             }
         };
@@ -816,7 +816,7 @@ impl HostRuntime {
                 }
                 return Err(KitError::non_retryable(
                     "sidecar_unavailable",
-                    "无法启动 sidecar IO actor",
+                    "Failed to start the sidecar IO actor",
                 ));
             }
         };
@@ -894,7 +894,7 @@ impl HostRuntime {
 
         let pending_scopes = self.lock_terminal_outbox().pending_scopes();
         let actors = self.actors.lock().map_err(|_| {
-            KitError::non_retryable("sidecar_unavailable", "scope actor 注册表不可用")
+            KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
         })?;
         for scope_id in delivered_scopes {
             if pending_scopes.contains(&scope_id) {
@@ -903,7 +903,7 @@ impl HostRuntime {
             if let Some(actor) = actors.get(&scope_id) {
                 clear_cleanup_failure(&actor.cleanup_result, CleanupFailureKind::TerminalEvent);
                 if !actor.clear_shutdown_failure(CleanupFailureKind::TerminalEvent) {
-                    return Err(sidecar_unavailable("无法同步 terminal cleanup 结果"));
+                    return Err(sidecar_unavailable("Failed to sync the terminal cleanup result"));
                 }
             }
         }
@@ -1770,7 +1770,7 @@ impl ScopeActor {
                 log::error!(
                     "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_timeout"
                 );
-                self.enter_dead(sidecar_unavailable("sidecar initialize 超时"));
+                self.enter_dead(sidecar_unavailable("sidecar initialize timed out"));
                 continue;
             }
             self.expire_load_flight();
@@ -1833,7 +1833,7 @@ impl ScopeActor {
                 log::error!(
                     "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_write_failed"
                 );
-                return Err(sidecar_unavailable("无法写入 sidecar initialize"));
+                return Err(sidecar_unavailable("Failed to write sidecar initialize"));
             }
         };
         self.initialize_id = Some(id);
@@ -1876,7 +1876,7 @@ impl ScopeActor {
                     );
                     // transport 终止时统一结算 load、active turn 和其它 pending。
                     self.finish_transport_death();
-                    self.enter_dead(sidecar_unavailable("sidecar stdio 已终止"));
+                    self.enter_dead(sidecar_unavailable("sidecar stdio terminated"));
                     return false;
                 }
             }
@@ -1933,13 +1933,13 @@ impl ScopeActor {
                         event = "sidecar_initialize_rejected",
                         "sidecar initialize result 不符合 ACP 能力、认证或 Efflab metadata 闭集"
                     );
-                    self.enter_dead(sidecar_unavailable("sidecar initialize 握手不受支持"));
+                    self.enter_dead(sidecar_unavailable("sidecar initialize handshake is not supported"));
                 }
                 Err(_) => {
                     log::error!(
                         "Host Agent Kit lifecycle stage=acp_initialize failed error_code=initialize_rpc_rejected"
                     );
-                    self.enter_dead(sidecar_unavailable("sidecar initialize 被拒绝"));
+                    self.enter_dead(sidecar_unavailable("sidecar initialize was rejected"));
                 }
             }
             return;
@@ -2062,7 +2062,7 @@ impl ScopeActor {
                 .reply_validated(id, ValidatedReply::Result(result), &self.policy)
                 .is_err()
             {
-                self.enter_dead(sidecar_unavailable("无法回复 sidecar permission 请求"));
+                self.enter_dead(sidecar_unavailable("Failed to reply to the sidecar permission request"));
             }
             return;
         }
@@ -2086,9 +2086,9 @@ impl ScopeActor {
                 tracing::debug!(
                     scope = %self.scope_id,
                     session = %session_id,
-                    "无法回复不支持的 sidecar 反向请求"
+                    "Failed to reply to the unsupported sidecar reverse request"
                 );
-                self.enter_dead(sidecar_unavailable("无法回复不支持的 sidecar 反向请求"));
+                self.enter_dead(sidecar_unavailable("Failed to reply to the unsupported sidecar reverse request"));
                 return;
             }
             tracing::debug!(
@@ -2111,7 +2111,7 @@ impl ScopeActor {
             )
             .is_err()
         {
-            self.enter_dead(sidecar_unavailable("无法回复未知 sidecar 请求"));
+            self.enter_dead(sidecar_unavailable("Failed to reply to the unknown sidecar request"));
         }
     }
 
@@ -2174,7 +2174,7 @@ impl ScopeActor {
         if !self.in_flight.is_empty() {
             let _ = reply.send(Err(KitError::non_retryable(
                 "session_busy",
-                "当前 scope 正在生成，不能创建新会话",
+                "This scope is currently generating; cannot create a new session",
             )));
             return;
         }
@@ -2192,7 +2192,7 @@ impl ScopeActor {
             }
             Err(error) => {
                 reject_unwritable_session_request("session/new", error, reply);
-                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+                self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
         }
     }
@@ -2216,7 +2216,7 @@ impl ScopeActor {
             }
             Err(error) => {
                 reject_unwritable_session_request("session/list", error, reply);
-                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+                self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
         }
     }
@@ -2226,14 +2226,14 @@ impl ScopeActor {
         if session_id.is_empty() {
             let _ = reply.send(Err(KitError::non_retryable(
                 "invalid_request",
-                "删除会话缺少 session_id",
+                "Delete session is missing session_id",
             )));
             return;
         }
         if self.load_flight.is_some() || !self.in_flight.is_empty() {
             let _ = reply.send(Err(KitError::non_retryable(
                 "session_busy",
-                "当前 scope 正在生成或恢复，不能删除会话",
+                "This scope is currently generating or resuming; cannot delete the session",
             )));
             return;
         }
@@ -2247,8 +2247,8 @@ impl ScopeActor {
                     .insert(id, PendingRpc::DeleteSession { session_id, reply });
             }
             Err(_) => {
-                let _ = reply.send(Err(sidecar_unavailable("无法写入 session/close")));
-                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+                let _ = reply.send(Err(sidecar_unavailable("Failed to write session/close")));
+                self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
         }
     }
@@ -2259,7 +2259,7 @@ impl ScopeActor {
             if flight.session_id != session_id {
                 let _ = reply.send(Err(KitError::non_retryable(
                     "session_busy",
-                    "当前 scope 正在恢复其它会话",
+                    "This scope is currently resuming another session",
                 )));
                 return;
             }
@@ -2287,7 +2287,7 @@ impl ScopeActor {
             }
             let _ = reply.send(Err(KitError::non_retryable(
                 "session_busy",
-                "当前 scope 正在生成，不能恢复其它会话",
+                "This scope is currently generating; cannot resume another session",
             )));
             return;
         }
@@ -2312,7 +2312,7 @@ impl ScopeActor {
     /// 将 resume waiter 立即排空为 accepted；不把同步回执绑定到 load result。
     fn accept_load_resume(&mut self, session_id: &str, reply: ReplySender) {
         let Some(flight) = self.load_flight.as_mut() else {
-            let _ = reply.send(Err(sidecar_unavailable("会话恢复状态已结束")));
+            let _ = reply.send(Err(sidecar_unavailable("Session resume state has ended")));
             return;
         };
         flight.accepted_resume = true;
@@ -2343,7 +2343,7 @@ impl ScopeActor {
             ticket.mark_not_written();
             let _ = reply.send(Err(KitError::non_retryable(
                 "turn_in_progress",
-                "该会话已有正在处理的回合",
+                "This session already has a turn in progress",
             )));
             return;
         }
@@ -2382,13 +2382,13 @@ impl ScopeActor {
         if !ticket.claim_for_prompt() {
             if !ticket.is_abandoned() {
                 ticket.mark_not_written();
-                let _ = reply.send(Err(sidecar_unavailable("Send 写入权已失效")));
+                let _ = reply.send(Err(sidecar_unavailable("Send write ticket has expired")));
             }
             return;
         }
         if self.cancel_requested.remove(&session_id) {
             ticket.mark_not_written();
-            self.emit_turn_status(&session_id, &submission_id, "cancelled", "回合已取消");
+            self.emit_turn_status(&session_id, &submission_id, "cancelled", "Turn cancelled");
             let _ = reply.send(Ok(send_reply(&session_id, &submission_id, false)));
             return;
         }
@@ -2427,8 +2427,8 @@ impl ScopeActor {
                     session = %session_id,
                     "session/prompt 在写入前失败"
                 );
-                let _ = reply.send(Err(sidecar_unavailable("无法写入 session/prompt")));
-                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+                let _ = reply.send(Err(sidecar_unavailable("Failed to write session/prompt")));
+                self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
             Err(RequestWriteFailure::MayHaveBeenWritten(_)) => {
                 ticket.mark_may_have_been_written();
@@ -2437,8 +2437,8 @@ impl ScopeActor {
                     session = %session_id,
                     "session/prompt 写入结局无法确认"
                 );
-                let _ = reply.send(Err(sidecar_unavailable("无法确认 session/prompt 是否写入")));
-                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+                let _ = reply.send(Err(sidecar_unavailable("Failed to confirm whether session/prompt was written")));
+                self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
         }
     }
@@ -2477,11 +2477,11 @@ impl ScopeActor {
                         generation,
                         LoadOutcome::Cancelled,
                     );
-                    self.enter_dead(sidecar_unavailable("sidecar load 已取消"));
+                    self.enter_dead(sidecar_unavailable("sidecar load was cancelled"));
                     return;
                 }
 
-                // 只有通知已经写入 sidecar，才向本地状态和产品事件声明该回合已取消。
+                // 只有通知已经写入 sidecar，才向本地状态和产品事件声明该Turn cancelled。
                 let cancelled_submission =
                     self.in_flight.get_mut(&session_id).and_then(|in_flight| {
                         if in_flight.cancelled {
@@ -2493,15 +2493,15 @@ impl ScopeActor {
                     });
                 if let Some(submission_id) = cancelled_submission {
                     self.cancel_requested.insert(session_id.clone());
-                    self.emit_turn_status(&session_id, &submission_id, "cancelled", "回合已取消");
+                    self.emit_turn_status(&session_id, &submission_id, "cancelled", "Turn cancelled");
                 } else if !self.in_flight.contains_key(&session_id) {
                     // 无 active turn 的 Cancel 仍保留一次性 pre-cancel 合同；BTreeSet 去重 marker。
                     self.cancel_requested.insert(session_id.clone());
                 }
             }
             Err(_) => {
-                let _ = reply.send(Err(sidecar_unavailable("无法写入 session/cancel")));
-                self.enter_dead(sidecar_unavailable("sidecar stdin 不可用"));
+                let _ = reply.send(Err(sidecar_unavailable("Failed to write session/cancel")));
+                self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
         }
     }
@@ -2515,13 +2515,13 @@ impl ScopeActor {
         if self.load_flight.is_some() {
             return Err(KitError::non_retryable(
                 "session_busy",
-                "当前 scope 已有正在进行的会话恢复",
+                "This scope already has a session resume in progress",
             ));
         }
         self.next_replay_epoch = self
             .next_replay_epoch
             .checked_add(1)
-            .ok_or_else(|| sidecar_unavailable("replay epoch 已耗尽"))?;
+            .ok_or_else(|| sidecar_unavailable("Replay epoch exhausted"))?;
         let replay_epoch = self.next_replay_epoch;
         self.current_session = Some(session_id.to_string());
         self.projector.begin_replay(session_id);
@@ -2534,7 +2534,7 @@ impl ScopeActor {
         let id = self
             .acp
             .request_validated("session/load", params, &self.policy)
-            .map_err(|_| sidecar_unavailable("无法写入 session/load"))?;
+            .map_err(|_| sidecar_unavailable("Failed to write session/load"))?;
         let mut flight = LoadFlight {
             session_id: session_id.to_string(),
             owner_request_id: id,
@@ -2570,7 +2570,7 @@ impl ScopeActor {
             Err(_) => None,
         };
         let Some(session_id) = session_id else {
-            let _ = reply.send(Err(sidecar_unavailable("sidecar 未返回有效 sessionId")));
+            let _ = reply.send(Err(sidecar_unavailable("sidecar did not return a valid sessionId")));
             return;
         };
         self.active_sessions.insert(session_id.clone());
@@ -2583,7 +2583,7 @@ impl ScopeActor {
     /// 映射标准 sidecar session/list 的四字段产品摘要。
     fn finish_list_sessions(&mut self, reply: ReplySender, result: Result<Value, RpcError>) {
         let Ok(result) = result else {
-            let _ = reply.send(Err(sidecar_unavailable("sidecar session/list 失败")));
+            let _ = reply.send(Err(sidecar_unavailable("sidecar session/list failed")));
             return;
         };
         let sessions = result
@@ -2647,11 +2647,11 @@ impl ScopeActor {
             Err(error) if is_close_session_not_found(&error) => {
                 let _ = reply.send(Err(KitError::non_retryable(
                     "session_not_found",
-                    "sidecar 未找到指定会话",
+                    "sidecar did not find the specified session",
                 )));
             }
             Err(_) => {
-                let _ = reply.send(Err(sidecar_unavailable("sidecar 删除会话失败")));
+                let _ = reply.send(Err(sidecar_unavailable("Failed to delete the sidecar session")));
             }
         }
     }
@@ -2720,7 +2720,7 @@ impl ScopeActor {
         ) && should_retire_after_load(outcome)
         {
             // 失败 load 的 transport 不再承载同 session 新 flight，隔离没有 generation 的旧 replay。
-            self.enter_dead(sidecar_unavailable("sidecar load 失败，transport 已退休"));
+            self.enter_dead(sidecar_unavailable("sidecar load failed; transport retired"));
         }
     }
 
@@ -2859,7 +2859,7 @@ impl ScopeActor {
         let replay_epoch = flight.replay_epoch;
         let generation = flight.generation;
         if self.acp.revoke_outbound_request(request_id).is_err() {
-            self.enter_dead(sidecar_unavailable("无法撤销超时 session/load 请求"));
+            self.enter_dead(sidecar_unavailable("Failed to cancel the timed-out session/load request"));
             return;
         }
         if self.finish_load_flight(
@@ -2870,7 +2870,7 @@ impl ScopeActor {
             LoadOutcome::Timeout,
         ) {
             // deadline 到期后退休整个 actor，避免没有 generation 的旧 replay 进入新 flight。
-            self.enter_dead(sidecar_unavailable("session/load 已超时，transport 已退休"));
+            self.enter_dead(sidecar_unavailable("session/load timed out; transport retired"));
         }
     }
 
@@ -2891,7 +2891,7 @@ impl ScopeActor {
         }
         match result {
             Ok(_) => {
-                self.emit_turn_status(&session_id, &submission_id, "turn_completed", "回合已完成")
+                self.emit_turn_status(&session_id, &submission_id, "turn_completed", "Turn completed")
             }
             Err(error) => self.emit_turn_status(
                 &session_id,
@@ -2915,10 +2915,10 @@ impl ScopeActor {
         match catalog {
             Ok(tools) => {
                 if tools.iter().any(|tool| !self.is_approved_tool(tool)) {
-                    tracing::debug!(scope = %self.scope_id, "MCP catalog 包含未批准工具，已终止 sidecar");
+                    tracing::debug!(scope = %self.scope_id, "MCP catalog contains unapproved tools，已终止 sidecar");
                     // 安全违例不是普通 transport dead；在显式 Channel 换代前永久保留 tombstone。
                     self.restart_blocked.store(true, Ordering::Release);
-                    self.enter_dead(sidecar_unavailable("MCP catalog 包含未批准工具"));
+                    self.enter_dead(sidecar_unavailable("MCP catalog contains unapproved tools"));
                     return;
                 }
                 if !self.expected_tools.is_empty() && !self.expected_tools.is_subset(&tools) {
@@ -2926,7 +2926,7 @@ impl ScopeActor {
                     self.emit_session_status(
                         &session_id,
                         "mcp_failed",
-                        "部分已批准 MCP 工具未就绪",
+                        "Some approved MCP tools are not ready",
                         Origin::Live,
                     );
                 } else {
@@ -2938,7 +2938,7 @@ impl ScopeActor {
                 self.emit_session_status(
                     &session_id,
                     "mcp_failed",
-                    "无法确认已批准 MCP 工具状态",
+                    "Cannot confirm the approved MCP tool status",
                     Origin::Live,
                 );
             }
@@ -2976,7 +2976,7 @@ impl ScopeActor {
             Err(_) => {
                 // catalog 的 JSON-RPC error 可以降级，但连查询都写不进 stdin 时 sidecar
                 // 已不可信，不能绕过 gate 继续写 prompt。
-                self.enter_dead(sidecar_unavailable("无法写入 MCP catalog 请求"));
+                self.enter_dead(sidecar_unavailable("Failed to write the MCP catalog request"));
             }
         }
     }
@@ -2994,7 +2994,7 @@ impl ScopeActor {
             self.catalog_pending.remove(&session_id);
             if self.acp.revoke_outbound_request(request_id).is_err() {
                 // 无法取得 ACP 账本锁时不能确信后续请求是否会被正确限额，保守停掉 scope。
-                self.enter_dead(sidecar_unavailable("无法撤销超时 MCP catalog 请求"));
+                self.enter_dead(sidecar_unavailable("Failed to cancel the timed-out MCP catalog request"));
                 return;
             }
             if matches!(
@@ -3032,7 +3032,7 @@ impl ScopeActor {
         self.emit_session_status(
             session_id,
             "replay_complete",
-            "历史重放完成",
+            "History replay completed",
             Origin::Replay,
         );
         if self.mcp_failed_sessions.contains(session_id) {
@@ -3040,7 +3040,7 @@ impl ScopeActor {
             self.emit_session_status(
                 session_id,
                 "mcp_failed",
-                "已批准 MCP 工具仍未就绪",
+                "Approved MCP tools are still not ready",
                 Origin::Live,
             );
         }
@@ -3061,7 +3061,7 @@ impl ScopeActor {
         self.emit_session_status(
             session_id,
             "replay_complete",
-            "历史重放完成",
+            "History replay completed",
             Origin::Replay,
         );
     }
@@ -3546,7 +3546,7 @@ impl ScopeActor {
             // 主动关闭也属于 ScopeDead；不要让已 accepted 的 cold resume 静默悬挂。
             self.finish_current_load(LoadOutcome::ScopeDead);
             let cancel_result = self.cancel_in_flight_before_shutdown();
-            self.finish_in_flight_turns("cancelled", "回合已取消");
+            self.finish_in_flight_turns("cancelled", "Turn cancelled");
             // shutdown 不能等待原定时器；已失败的 terminal event 必须立即再试一次。
             self.retry_pending_terminal_events_now();
             let mut cleanup = self.cleanup_resources();
@@ -3560,7 +3560,7 @@ impl ScopeActor {
                 cleanup.record(CleanupFailureKind::TerminalEvent);
             }
             cleanup.merge(&cancel_result);
-            self.reject_pending(sidecar_unavailable("sidecar 已关闭"));
+            self.reject_pending(sidecar_unavailable("sidecar is closed"));
             let terminal_intent_pending = !self.pending_terminal_intents.is_empty();
             self.handoff_pending_terminal_events();
             if resources_cleaned && !terminal_intent_pending {
@@ -3606,7 +3606,7 @@ impl ScopeActor {
                 let cleanup = self.shutdown_and_exit();
                 attempt.complete(cleanup);
             }
-            command => send_command_error(command, sidecar_unavailable("sidecar 不可用")),
+            command => send_command_error(command, sidecar_unavailable("sidecar is unavailable")),
         }
     }
 
@@ -3645,10 +3645,10 @@ fn request_actor(
     let (reply, receiver) = mpsc::sync_channel(1);
     actor
         .submit(make(reply))
-        .map_err(|_| sidecar_unavailable("scope actor 已退出"))?;
+        .map_err(|_| sidecar_unavailable("Scope actor has exited"))?;
     receiver
         .recv_timeout(DISPATCH_REPLY_TIMEOUT)
-        .map_err(|_| sidecar_unavailable("等待 sidecar 回执超时"))?
+        .map_err(|_| sidecar_unavailable("Timed out waiting for the sidecar reply"))?
 }
 
 /// Send timeout 的两种所有权结局：未写入时可撤销登记，已取得票据时必须保留幂等键。
@@ -3695,14 +3695,14 @@ fn request_send_actor_with_timeout(
         })
         .map_err(|_| {
             ticket.mark_not_written();
-            SendRequestError::BeforePrompt(sidecar_unavailable("scope actor 已退出"))
+            SendRequestError::BeforePrompt(sidecar_unavailable("Scope actor has exited"))
         })?;
 
     match receiver.recv_timeout(reply_timeout) {
         Ok(Ok(reply)) => Ok(reply),
         Ok(Err(error)) => Err(classify_send_error(&ticket, error)),
         Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
-            let error = sidecar_unavailable("等待 sidecar 回执超时");
+            let error = sidecar_unavailable("Timed out waiting for the sidecar reply");
             if ticket.abandon() {
                 // 票据先获撤销；迟到的 Send command 即使被 actor 取出也不能写 prompt。
                 Err(SendRequestError::BeforePrompt(error))
@@ -3751,7 +3751,7 @@ fn send_command_error(command: ActorCommand, error: KitError) {
 /// 生成 HostPolicy：所有 `_meta` 许可显式按 method 列出，不能跨 method 泄漏。
 fn host_policy(launched: &LaunchedScope) -> Result<HostPolicy, KitError> {
     let cwd = std::fs::canonicalize(&launched.paths.workspace)
-        .map_err(|_| sidecar_unavailable("scope workspace 不可用"))?;
+        .map_err(|_| sidecar_unavailable("Scope workspace is unavailable"))?;
     Ok(HostPolicy::new(cwd)
         .with_meta_key_for("session/new", "modelId")
         .with_meta_key_for("session/load", "modelId")
@@ -3763,7 +3763,7 @@ fn host_policy(launched: &LaunchedScope) -> Result<HostPolicy, KitError> {
 fn invalid_mentions_request() -> KitError {
     KitError::non_retryable(
         "invalid_request",
-        "Send mention 无法解析或文本不符合安全策略",
+        "Send mention cannot be resolved or the text violates the safety policy",
     )
 }
 
@@ -3833,7 +3833,7 @@ fn validate_send_input(
     {
         return Err(KitError::non_retryable(
             "invalid_request",
-            "Send 请求缺少有效标识或文本不符合安全策略",
+            "Send request is missing valid identifiers or the text violates the safety policy",
         ));
     }
     Ok(())
@@ -3866,7 +3866,7 @@ fn reject_unwritable_session_request(method: &str, error: anyhow::Error, reply: 
     log::error!(
         "Host Agent Kit lifecycle stage=acp_write failed method={method} error_code=sidecar_unavailable reason={reason}"
     );
-    let _ = reply.send(Err(sidecar_unavailable(&format!("无法写入 {method}"))));
+    let _ = reply.send(Err(sidecar_unavailable(&format!("Failed to write {method}"))));
 }
 
 /// 只把明确的 ACP NotFound 错误码映射为 session_not_found。
@@ -3883,15 +3883,15 @@ fn is_close_session_not_found(error: &RpcError) -> bool {
 fn load_outcome_error(outcome: LoadOutcome) -> KitError {
     match outcome {
         LoadOutcome::SessionNotFound => {
-            KitError::non_retryable("session_not_found", "sidecar 未找到指定会话")
+            KitError::non_retryable("session_not_found", "sidecar did not find the specified session")
         }
-        LoadOutcome::LoadError => sidecar_unavailable("sidecar 加载会话失败，可重试"),
-        LoadOutcome::Timeout => sidecar_unavailable("session/load 超时，可重试"),
-        LoadOutcome::Cancelled => KitError::non_retryable("cancelled", "会话恢复已取消"),
+        LoadOutcome::LoadError => sidecar_unavailable("Failed to load the sidecar session; retryable"),
+        LoadOutcome::Timeout => sidecar_unavailable("session/load timed out; retryable"),
+        LoadOutcome::Cancelled => KitError::non_retryable("cancelled", "Session resume cancelled"),
         LoadOutcome::TransportDeath | LoadOutcome::ScopeDead => {
-            sidecar_unavailable("sidecar 不可用，可重试")
+            sidecar_unavailable("sidecar is unavailable; retryable")
         }
-        LoadOutcome::Success => sidecar_unavailable("session/load 状态无效"),
+        LoadOutcome::Success => sidecar_unavailable("session/load state is invalid"),
     }
 }
 
@@ -4267,7 +4267,7 @@ mod restart_gate_tests {
         assert!(!error.retryable, "restart 失败必须保留重启应用协议");
         assert_eq!(
             error.message,
-            "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试"
+            "LLM Channel saved, but the sidecar failed to restart; please restart the app and try again"
         );
         assert_eq!(
             mcp_calls.load(Ordering::Acquire),
@@ -4297,9 +4297,9 @@ mod tests {
     fn turn_failure_user_message_hides_sidecar_and_maps_model_error() {
         assert_eq!(
             turn_failure_user_message("turn_model_error"),
-            "模型没有返回有效回复，请重试"
+            "The model did not return a valid reply; please retry"
         );
-        assert_eq!(turn_failure_user_message("unknown"), "回复未完成，请重试");
+        assert_eq!(turn_failure_user_message("unknown"), "Reply did not complete; please retry");
         assert!(
             !turn_failure_user_message("turn_model_error").contains("sidecar"),
             "用户提示不得出现 sidecar"
@@ -5801,7 +5801,7 @@ done
                 cancelled: false,
             },
         );
-        actor.finish_in_flight_turns("error", "终态错误");
+        actor.finish_in_flight_turns("error", "Terminal error");
         assert!(
             !actor
                 .terminal_turns
@@ -6138,7 +6138,7 @@ done
                     block_id: event_id,
                     block: KitBlock::Status {
                         code: "error".to_string(),
-                        message: "终态错误".to_string(),
+                        message: "Terminal error".to_string(),
                     },
                 },
                 retain: true,

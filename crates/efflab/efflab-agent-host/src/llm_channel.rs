@@ -134,27 +134,27 @@ impl LlmChannelError {
     pub fn as_kit_error(self) -> KitError {
         match self {
             Self::Unconfigured => {
-                KitError::non_retryable("llm_channel_unconfigured", "尚未配置可用的大模型通道")
+                KitError::non_retryable("llm_channel_unconfigured", "No available LLM channel configured")
             }
             Self::InvalidRequest => {
-                KitError::non_retryable("invalid_request", "LLM Channel 请求不完整")
+                KitError::non_retryable("invalid_request", "Incomplete LLM Channel request")
             }
             Self::RelayNotImplemented => {
-                KitError::non_retryable("unsupported", "Relay Channel 尚未实现")
+                KitError::non_retryable("unsupported", "Relay Channel is not implemented")
             }
             Self::SealFailed
             | Self::PersistFailed
             | Self::UnsealFailed
             | Self::StateUnavailable => {
-                KitError::non_retryable("missing_api_key", "LLM Channel 密封秘密不可用")
+                KitError::non_retryable("missing_api_key", "LLM Channel sealed secret is unavailable")
             }
             Self::StaleChannelRevision => KitError::non_retryable(
                 "llm_channel_unconfigured",
-                "LLM Channel 已更新，请重启 sidecar",
+                "LLM Channel updated; please restart the sidecar",
             ),
             Self::RestartFailed | Self::LifecycleFailed => KitError {
                 code: "sidecar_unavailable".to_string(),
-                message: "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试".to_string(),
+                message: "LLM Channel saved, but the sidecar failed to restart; please restart the app and try again".to_string(),
                 details: None,
                 request_id: None,
                 retryable: false,
@@ -168,16 +168,16 @@ impl fmt::Display for LlmChannelError {
     /// 错误文本保持通用，避免把上游 URL、产品错误链或秘密带给调用方。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
-            Self::Unconfigured => "LLM Channel 未配置",
-            Self::InvalidRequest => "LLM Channel 请求无效",
-            Self::RelayNotImplemented => "Relay Channel 尚未实现",
-            Self::SealFailed => "LLM Channel 密封失败",
-            Self::PersistFailed => "LLM Channel 持久化失败",
-            Self::UnsealFailed => "LLM Channel 解封失败",
-            Self::StaleChannelRevision => "LLM Channel revision 已过期",
-            Self::StateUnavailable => "LLM Channel 状态不可用",
-            Self::RestartFailed => "sidecar 批量重启失败",
-            Self::LifecycleFailed => "L3b 或 sidecar 生命周期失败",
+            Self::Unconfigured => "LLM Channel is not configured",
+            Self::InvalidRequest => "Invalid LLM Channel request",
+            Self::RelayNotImplemented => "Relay Channel is not implemented",
+            Self::SealFailed => "Failed to seal the LLM Channel",
+            Self::PersistFailed => "Failed to persist the LLM Channel",
+            Self::UnsealFailed => "Failed to unseal the LLM Channel",
+            Self::StaleChannelRevision => "LLM Channel revision is stale",
+            Self::StateUnavailable => "LLM Channel state is unavailable",
+            Self::RestartFailed => "Failed to restart sidecars in bulk",
+            Self::LifecycleFailed => "L3b or sidecar lifecycle failed",
         };
         formatter.write_str(text)
     }
@@ -202,7 +202,7 @@ mod error_contract_tests {
             assert!(!kit_error.retryable);
             assert_eq!(
                 kit_error.message,
-                "LLM Channel 已保存，但 sidecar 重启失败，请重启应用后再试"
+                "LLM Channel saved, but the sidecar failed to restart; please restart the app and try again"
             );
         }
     }
