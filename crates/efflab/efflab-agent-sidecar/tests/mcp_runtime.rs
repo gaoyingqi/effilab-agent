@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 
 use efflab_agent_contract::{ApprovedMcpConfig, McpServerSpec, load_runtime_config_v1};
 use efflab_agent_sidecar::mcp_client::{
-    MAX_MCP_OUTPUT_BYTES, MCP_CALL_TIMEOUT, MCP_INITIALIZE_TIMEOUT, McpCancellationToken,
-    McpRuntime, is_literal_loopback_http_url,
+    MAX_MCP_CALL_RESPONSE_BODY_BYTES, MAX_MCP_OUTPUT_BYTES, MCP_CALL_TIMEOUT,
+    MCP_INITIALIZE_TIMEOUT, McpCancellationToken, McpRuntime, dropped_display_payload_count,
+    is_literal_loopback_http_url,
 };
 use efflab_agent_sidecar::session_store::MAX_RECORD_ID_BYTES;
 use serde_json::{Value, json};
@@ -85,6 +86,8 @@ enum ServerPlan {
     LargeResult(usize),
     /// `_meta["purelab/display"]` 超过 64KB 显示上限但 body 未超 1MiB。
     DisplayMetaOversize,
+    /// `_meta` 整体超过旧 1MiB body 上限：display 不合规丢弃，正常 content 保留。
+    HugeMetaOversize,
     LargeContentLength(usize),
     LargeChunked(usize),
     SseNotificationThenResponse,
@@ -728,6 +731,7 @@ fn serve_http_request(
                 | ServerPlan::DelayCall
                 | ServerPlan::LargeResult(_)
                 | ServerPlan::DisplayMetaOversize
+                | ServerPlan::HugeMetaOversize
                 | ServerPlan::LargeContentLength(_)
                 | ServerPlan::LargeChunked(_)
                 | ServerPlan::SseNotificationThenResponse
@@ -847,6 +851,28 @@ fn serve_http_request(
                     true,
                 );
             }
+            ServerPlan::HugeMetaOversize => {
+                // 整个 `_meta` 超过旧 1MiB body cap：超 64KB 的 display 必须被
+                // 丢弃并计数，正常 content 不得被传输层整次拒绝。
+                let display_blob = "x".repeat(100 * 1024);
+                let meta_padding = "m".repeat(1024 * 1024);
+                write_json_response(
+                    stream,
+                    200,
+                    json_rpc_result(
+                        request_id(body),
+                        json!({
+                            "content": [{"type": "text", "text": "ok"}],
+                            "isError": false,
+                            "_meta": {
+                                "purelab/display": {"v": 1, "type": "tag_card", "blob": display_blob},
+                                "padding": meta_padding
+                            }
+                        }),
+                    ),
+                    true,
+                );
+            }
             ServerPlan::LargeContentLength(size) => {
                 write_large_json_response(
                     stream,
@@ -920,7 +946,7 @@ fn serve_http_request(
                     stream,
                     "204 No Content",
                     "application/json",
-                    MAX_MCP_OUTPUT_BYTES + 1,
+                    MAX_MCP_CALL_RESPONSE_BODY_BYTES + 1,
                     "",
                     std::iter::empty::<(&str, &str)>(),
                 );
@@ -1233,7 +1259,7 @@ fn write_oversized_sse_chunked_response(
     let response = serde_json::to_string(&response).expect("SSE response 必须可序列化");
     let body = format!(
         "data: {response}\n\n{}",
-        "x".repeat(MAX_MCP_OUTPUT_BYTES + 1)
+        "x".repeat(MAX_MCP_CALL_RESPONSE_BODY_BYTES + 1)
     );
     let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     if write_counted(stream, headers, response_bytes_sent).is_err() {
@@ -1252,9 +1278,10 @@ fn write_oversized_sse_chunked_response(
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// 构造超过 body cap 的原始响应，供状态/错误/DELETE shortcut 使用。
+/// 构造超过 tools/call 响应 cap 的原始响应，供状态/错误/DELETE shortcut 使用。
+/// DELETE 的严格 1MiB cap 同样被该尺寸触发。
 fn oversized_response_body() -> String {
-    "x".repeat(MAX_MCP_OUTPUT_BYTES + 1)
+    "x".repeat(MAX_MCP_CALL_RESPONSE_BODY_BYTES + 1)
 }
 
 /// 构造恰好达到 body cap 的合法 JSON-RPC response，验证等于上限仍可解码。
@@ -3022,6 +3049,27 @@ async fn oversized_display_meta_drops_field_but_keeps_content() {
 }
 
 #[tokio::test]
+async fn huge_meta_over_old_body_cap_only_drops_display_over_http() {
+    // 回归：`_meta` 整体超过旧 1MiB body cap 时，传输层（tools/call 上限 2MiB）
+    // 必须先放行，归一化层丢弃不合规 display 并计数，正常 content 保留。
+    // 注：丢弃计数为进程级共享，并发测试可能同时递增，故只断言增长。
+    let before = dropped_display_payload_count();
+    let server = MockMcpServer::start(ServerPlan::HugeMetaOversize);
+    let runtime = runtime_with_server("huge", &server, ["huge__ok"]).await;
+    let result = runtime
+        .call("huge__ok", json!({}))
+        .await
+        .expect("_meta 超过旧 body cap 时调用必须成功并降级 display");
+    assert_eq!(result.text_content(), Some("ok"), "正常 content 必须保留");
+    assert!(result.display.is_none(), "超限 display 必须被丢弃");
+    assert!(
+        dropped_display_payload_count() > before,
+        "display 丢弃计数必须随本次调用递增"
+    );
+    runtime.shutdown().await.expect("session 必须可关闭");
+}
+
+#[tokio::test]
 async fn server_name_boundary_matches_contract() {
     let server = MockMcpServer::start(ServerPlan::Tools(vec!["ok".to_owned()]));
     let valid_name = format!("a{}", "x".repeat(63));
@@ -3080,8 +3128,8 @@ async fn call_timeout_uses_short_fixture_and_bounds_full_operation() {
 #[tokio::test]
 async fn content_length_and_chunked_bodies_are_limited_before_full_decode() {
     for plan in [
-        ServerPlan::LargeContentLength(2 * 1024 * 1024),
-        ServerPlan::LargeChunked(2 * 1024 * 1024),
+        ServerPlan::LargeContentLength(2 * MAX_MCP_CALL_RESPONSE_BODY_BYTES),
+        ServerPlan::LargeChunked(2 * MAX_MCP_CALL_RESPONSE_BODY_BYTES),
     ] {
         let server = MockMcpServer::start(plan);
         let runtime = runtime_with_server("large", &server, ["large__ok"]).await;
@@ -3091,25 +3139,29 @@ async fn content_length_and_chunked_bodies_are_limited_before_full_decode() {
             .expect_err("超出 body cap 的 MCP body 必须在解码前拒绝");
         assert_eq!(error.code(), "mcp_output_too_large");
         assert!(
-            server.response_bytes_sent() < 1_200_000,
-            "body limiter 不得完整接收 2 MiB body，实际已接收 {} bytes",
+            server.response_bytes_sent() < MAX_MCP_CALL_RESPONSE_BODY_BYTES + 200_000,
+            "body limiter 不得完整接收两倍于 cap 的 body，实际已接收 {} bytes",
             server.response_bytes_sent()
         );
     }
 }
 
 #[tokio::test]
-async fn response_body_over_exact_one_mib_is_rejected_before_decode() {
-    let server = MockMcpServer::start(ServerPlan::LargeContentLength(MAX_MCP_OUTPUT_BYTES + 1));
+async fn response_body_over_call_cap_is_rejected_before_decode() {
+    // tools/call 响应上限已放宽到 2MiB；超过该上限仍必须 fail-closed。
+    // Content-Length 预检在读取 body 前拒绝，服务端实际发送量应远小于 cap。
+    let server = MockMcpServer::start(ServerPlan::LargeContentLength(
+        MAX_MCP_CALL_RESPONSE_BODY_BYTES + 1,
+    ));
     let runtime = runtime_with_server("large", &server, ["large__ok"]).await;
     let error = runtime
         .call("large__ok", json!({}))
         .await
-        .expect_err("超过严格 1 MiB body cap 的响应必须拒绝");
+        .expect_err("超过 tools/call body cap 的响应必须拒绝");
     assert_eq!(error.code(), "mcp_output_too_large");
     assert!(
         server.response_bytes_sent() < MAX_MCP_OUTPUT_BYTES,
-        "严格 body cap 必须在读取完整响应前拒绝，实际已发送 {} bytes",
+        "Content-Length 预检必须在读取 body 前拒绝，实际已发送 {} bytes",
         server.response_bytes_sent()
     );
 }
@@ -3230,7 +3282,7 @@ async fn nonzero_content_length_204_delete_fails_closed() {
 }
 
 #[tokio::test]
-async fn chunked_sse_body_over_one_mib_is_rejected_after_matching_frame() {
+async fn chunked_sse_body_over_call_cap_is_rejected_after_matching_frame() {
     let server = MockMcpServer::start(ServerPlan::SseOversizedChunkedBody);
     let runtime = runtime_with_server("sse", &server, ["sse__ok"]).await;
     let error = runtime

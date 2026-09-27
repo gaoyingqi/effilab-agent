@@ -39,8 +39,18 @@ const MAX_MCP_DISPLAY_DEPTH: usize = 16;
 /// display 载荷校验失败的内部计数；不进入 wire、journal 或模型输入。
 static DROPPED_DISPLAY_PAYLOADS: AtomicU64 = AtomicU64::new(0);
 
+/// 已丢弃的 display 载荷总数；仅供内部遥测与集成测试观察。
+#[doc(hidden)]
+pub fn dropped_display_payload_count() -> u64 {
+    DROPPED_DISPLAY_PAYLOADS.load(Ordering::Relaxed)
+}
+
 /// JSON-RPC 请求和响应在解码前的严格物化上限。
 const MAX_MCP_RESPONSE_BODY_BYTES: usize = MAX_MCP_OUTPUT_BYTES;
+/// `tools/call` 响应在解码前的物化上限：1MiB 归一化输出 + 64KB display
+/// 预留 + `_meta` 余量。超大 `_meta`（含不合规 display）必须能在归一化层
+/// 降级为「只丢 display」，而不是在传输层整次拒绝。
+pub const MAX_MCP_CALL_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// 限制请求参数在发送前的物化大小，防止模型参数形成无界 HTTP 请求。
 const MAX_MCP_REQUEST_BODY_BYTES: usize = MAX_MCP_OUTPUT_BYTES;
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1268,6 +1278,8 @@ impl McpRuntime {
             Err(error) => return RunCallOutcome::keep(Err(error)),
         };
         let message = Self::call_request_message(request_id.clone(), tool_name, &arguments);
+        // tools/call 使用放宽后的响应上限；超大 `_meta` 在归一化层降级为「只丢
+        // display」，而不是在传输层整次拒绝。
         let response = match post_json_rpc(
             &session.client,
             &session.url,
@@ -1277,6 +1289,7 @@ impl McpRuntime {
             deadline,
             Some(cancellation.clone()),
             None,
+            MAX_MCP_CALL_RESPONSE_BODY_BYTES,
         )
         .await
         {
@@ -1310,6 +1323,7 @@ impl McpRuntime {
                     deadline,
                     Some(cancellation),
                     None,
+                    MAX_MCP_CALL_RESPONSE_BODY_BYTES,
                 )
                 .await
                 {
@@ -1407,6 +1421,7 @@ impl McpRuntime {
             deadline,
             Some(cancellation.clone()),
             Some(&mut captured_session_id),
+            MAX_MCP_RESPONSE_BODY_BYTES,
         )
         .await
         {
@@ -1472,6 +1487,7 @@ impl McpRuntime {
             deadline,
             Some(cancellation),
             None,
+            MAX_MCP_RESPONSE_BODY_BYTES,
         )
         .await
         {
@@ -3151,6 +3167,7 @@ async fn connect_http_session(
         deadline,
         None,
         Some(&mut captured_session_id),
+        MAX_MCP_RESPONSE_BODY_BYTES,
     )
     .await
     {
@@ -3222,6 +3239,7 @@ async fn connect_http_session(
         deadline,
         None,
         None,
+        MAX_MCP_RESPONSE_BODY_BYTES,
     )
     .await
     .map_err(map_initialization_error)
@@ -3277,6 +3295,7 @@ async fn connect_http_session(
             deadline,
             None,
             None,
+            MAX_MCP_RESPONSE_BODY_BYTES,
         )
         .await
         {
@@ -3550,7 +3569,9 @@ fn parse_tools_page(result: Value) -> Result<(Vec<McpCatalogTool>, Option<String
     Ok((parsed.into_values().collect(), next_cursor))
 }
 
-/// 发送一个 JSON-RPC HTTP message；body cap 位于 serde JSON response 解码之前。
+/// 发送一个 JSON-RPC HTTP message；body_cap 位于 serde JSON response 解码之前。
+/// tools/call 传 MAX_MCP_CALL_RESPONSE_BODY_BYTES 以容纳超大 `_meta` 的降级，
+/// 其余方法保持严格 MAX_MCP_RESPONSE_BODY_BYTES。
 async fn post_json_rpc(
     client: &reqwest::Client,
     url: &str,
@@ -3560,6 +3581,7 @@ async fn post_json_rpc(
     deadline: tokio::time::Instant,
     cancellation: Option<McpCancellationToken>,
     session_id_capture: Option<&mut Option<String>>,
+    body_cap: usize,
 ) -> Result<Option<McpRpcResponse>, McpError> {
     let body = serde_json::to_vec(message).map_err(|_| McpError::CallFailed)?;
     if body.len() > MAX_MCP_REQUEST_BODY_BYTES {
@@ -3587,14 +3609,14 @@ async fn post_json_rpc(
         *capture = session_id.clone();
     }
     let status = response.status();
-    validate_response_headers(&response)?;
+    validate_response_headers(&response, body_cap)?;
     if status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::NO_CONTENT {
-        drain_limited_body(response, deadline, cancellation).await?;
+        drain_limited_body(response, deadline, cancellation, body_cap).await?;
         return Ok(None);
     }
     if !status.is_success() {
         let session_expired = session.is_some() && status == reqwest::StatusCode::NOT_FOUND;
-        drain_limited_body(response, deadline, cancellation).await?;
+        drain_limited_body(response, deadline, cancellation, body_cap).await?;
         return Err(if session_expired {
             McpError::SessionExpired
         } else {
@@ -3612,6 +3634,7 @@ async fn post_json_rpc(
         expected_id,
         deadline,
         cancellation,
+        body_cap,
     )
     .await?;
     let parsed = parsed.map(|response| with_session_id(response, session_id));
@@ -3643,7 +3666,10 @@ impl McpRpcResponse {
 }
 
 /// 校验响应 header，覆盖普通、204、错误和 DELETE 等不解码路径。
-fn validate_response_headers(response: &reqwest::Response) -> Result<(), McpError> {
+fn validate_response_headers(
+    response: &reqwest::Response,
+    body_cap: usize,
+) -> Result<(), McpError> {
     let declared_length = match response.headers().get(reqwest::header::CONTENT_LENGTH) {
         None => None,
         Some(value) => Some(
@@ -3661,7 +3687,7 @@ fn validate_response_headers(response: &reqwest::Response) -> Result<(), McpErro
                 })?,
         ),
     };
-    if declared_length.is_some_and(|length| length > MAX_MCP_RESPONSE_BODY_BYTES as u64) {
+    if declared_length.is_some_and(|length| length > body_cap as u64) {
         tracing::debug!(
             event = "mcp_response_body_rejected",
             error_code = McpError::OutputTooLarge.code(),
@@ -3700,6 +3726,7 @@ async fn drain_limited_body(
     mut response: reqwest::Response,
     deadline: tokio::time::Instant,
     cancellation: Option<McpCancellationToken>,
+    body_cap: usize,
 ) -> Result<(), McpError> {
     let mut total_bytes = 0_usize;
     loop {
@@ -3710,7 +3737,7 @@ async fn drain_limited_body(
         let Some(next_size) = total_bytes.checked_add(chunk.len()) else {
             return Err(McpError::OutputTooLarge);
         };
-        if next_size > MAX_MCP_RESPONSE_BODY_BYTES {
+        if next_size > body_cap {
             tracing::debug!(
                 event = "mcp_response_body_rejected",
                 error_code = McpError::OutputTooLarge.code(),
@@ -3729,6 +3756,7 @@ async fn read_response_message(
     expected_id: Option<&Value>,
     deadline: tokio::time::Instant,
     cancellation: Option<McpCancellationToken>,
+    body_cap: usize,
 ) -> Result<Option<McpRpcResponse>, McpError> {
     let is_json = content_type
         .map(|value| value.split(';').next().unwrap_or_default().trim())
@@ -3740,11 +3768,11 @@ async fn read_response_message(
         drop(response);
         return Err(McpError::CallFailed);
     }
-    validate_response_headers(&response)?;
+    validate_response_headers(&response, body_cap)?;
     if is_sse {
-        return read_sse_message(response, expected_id, deadline, cancellation).await;
+        return read_sse_message(response, expected_id, deadline, cancellation, body_cap).await;
     }
-    let body = read_limited_body(response, deadline, cancellation).await?;
+    let body = read_limited_body(response, deadline, cancellation, body_cap).await?;
     if body.is_empty() {
         return Ok(None);
     }
@@ -3760,6 +3788,7 @@ async fn read_limited_body(
     mut response: reqwest::Response,
     deadline: tokio::time::Instant,
     cancellation: Option<McpCancellationToken>,
+    body_cap: usize,
 ) -> Result<Vec<u8>, McpError> {
     let mut body = Vec::new();
     loop {
@@ -3770,7 +3799,7 @@ async fn read_limited_body(
         let Some(next_size) = body.len().checked_add(chunk.len()) else {
             return Err(McpError::OutputTooLarge);
         };
-        if next_size > MAX_MCP_RESPONSE_BODY_BYTES {
+        if next_size > body_cap {
             tracing::debug!(
                 event = "mcp_response_body_rejected",
                 error_code = McpError::OutputTooLarge.code(),
@@ -3789,6 +3818,7 @@ async fn read_sse_message(
     expected_id: Option<&Value>,
     deadline: tokio::time::Instant,
     cancellation: Option<McpCancellationToken>,
+    body_cap: usize,
 ) -> Result<Option<McpRpcResponse>, McpError> {
     let mut buffered = Vec::new();
     let mut total_bytes = 0_usize;
@@ -3809,7 +3839,7 @@ async fn read_sse_message(
         let Some(next_size) = total_bytes.checked_add(chunk.len()) else {
             return Err(McpError::OutputTooLarge);
         };
-        if next_size > MAX_MCP_RESPONSE_BODY_BYTES {
+        if next_size > body_cap {
             tracing::debug!(
                 event = "mcp_response_body_rejected",
                 error_code = McpError::OutputTooLarge.code(),
@@ -4027,7 +4057,7 @@ async fn close_http_session(
         status = status.as_u16(),
         "MCP session close 收到响应"
     );
-    if let Err(error) = validate_response_headers(&response) {
+    if let Err(error) = validate_response_headers(&response, MAX_MCP_RESPONSE_BODY_BYTES) {
         drop(response);
         tracing::debug!(
             event = "mcp_session_close_body_rejected",
@@ -4036,7 +4066,14 @@ async fn close_http_session(
         );
         return Err(McpError::ShutdownFailed);
     }
-    if let Err(error) = drain_limited_body(response, deadline, cancellation).await {
+    if let Err(error) = drain_limited_body(
+        response,
+        deadline,
+        cancellation,
+        MAX_MCP_RESPONSE_BODY_BYTES,
+    )
+    .await
+    {
         tracing::debug!(
             event = "mcp_session_close_body_read_failed",
             error_code = error.code(),
@@ -4121,7 +4158,8 @@ fn is_tool_name_segment(name: &str) -> bool {
 
 /// 将 rmcp 风格的 call result 转换为本地有界 DTO。display 先于总大小限制
 /// 提取并单独校验（≤64KB，超限即丢弃），巨大 `_meta` 不再拖垮正常 content；
-/// 1 MiB 上限只施加在最终保留的 content/structuredContent 上。
+/// 1 MiB 上限只施加在最终保留的 content/structuredContent 上。传输层为该
+/// 降级预留空间：tools/call 响应 body 上限为 MAX_MCP_CALL_RESPONSE_BODY_BYTES。
 fn normalize_call_result(result: Value) -> Result<McpCallResult, McpError> {
     let object = result.as_object().ok_or(McpError::CallFailed)?;
     // 先独立提取显示载荷：校验失败只丢字段，与 content 成败解耦。
@@ -4268,9 +4306,11 @@ fn contains_absolute_path_string(text: &str) -> bool {
 /// 只按字符迭代，不跨 UTF-8 边界切片。
 fn ends_with_file_token(head: &str) -> bool {
     let mut chars = head.chars().rev();
-    let token_matches = ['e', 'l', 'i', 'f']
-        .into_iter()
-        .all(|want| chars.next().is_some_and(|got| got.eq_ignore_ascii_case(&want)));
+    let token_matches = ['e', 'l', 'i', 'f'].into_iter().all(|want| {
+        chars
+            .next()
+            .is_some_and(|got| got.eq_ignore_ascii_case(&want))
+    });
     token_matches && is_path_boundary(chars.next())
 }
 
