@@ -839,9 +839,18 @@ fn tool_update_without_or_with_bad_display_keeps_tool_block() {
     let cases = [
         json!({}),
         json!({"rawOutput": {"display": "not-an-object"}}),
+        // 与 sidecar 形状校验对齐：缺 v/type 的 object 同样丢弃。
+        json!({"rawOutput": {"display": {"title": "缺 v/type"}}}),
+        json!({"rawOutput": {"display": {"v": 1}}}),
         json!({"rawOutput": {"display": {"v": 1, "type": "x", "path": "/etc/passwd"}}}),
+        // 首字符 `/` 后跟空白或字符串结束同样是 POSIX 绝对路径根。
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "path": "/"}}}),
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "path": "/ My Music/a.wav"}}}),
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "/abs-key": 1}}}),
         json!({"rawOutput": {"display": {"v": 1, "type": "x", "path": "C:\\Temp\\x.wav"}}}),
         json!({"rawOutput": {"display": {"v": 1, "type": "x", "u": "file:///etc/x"}}}),
+        // 非 ASCII 文本不得让路径检查 panic，且 `file:` 词根语义不变。
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "u": "见 file:secret"}}}),
     ];
     for (index, extra) in cases.iter().enumerate() {
         let mut update = json!({
@@ -868,6 +877,29 @@ fn tool_update_without_or_with_bad_display_keeps_tool_block() {
         assert_eq!(*status, ToolStatus::Completed);
         assert!(display.is_none(), "不合规 display 必须被丢弃: {extra}");
     }
+
+    // 非 ASCII 词根（`éfile:`）与正文文本不是 file: URI，display 必须保留，
+    // 回归保证多字节字符前的路径检查不 panic、不误伤。
+    let update = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-nonascii",
+            "status": "completed",
+            "rawOutput": {
+                "display": {"v": 1, "type": "x", "éabc: k": "éfile: 不是 URI", "note": "drums/percussion"}
+            }
+        }),
+        meta,
+    );
+    let events = apply_acp_notification(&mut projector, "session/update", &update)
+        .expect("合法非 ASCII display 必须可投影");
+    let KitBlock::Tool { display, .. } = &events[0].block else {
+        panic!("必须是 tool block");
+    };
+    assert_eq!(
+        display.as_ref().and_then(|d| d.get("note")),
+        Some(&json!("drums/percussion"))
+    );
 }
 
 /// display 先经孤儿 update 暂存，迟到的完整 tool_call 合并后仍保留载荷。

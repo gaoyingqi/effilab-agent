@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use efflab_agent_contract::{LoopbackModelSpec, RuntimeConfigV1, is_literal_loopback_http_url};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
 /// Chat Completions 请求体的最大字节数。
@@ -150,6 +150,11 @@ impl ModelTurnRequest {
         let mut object = Map::new();
         object.insert("model".to_owned(), Value::String(model_id.to_owned()));
         object.insert("stream".to_owned(), Value::Bool(true));
+        // OpenAI 兼容契约：流式 usage 只在显式索取时返回，缺失则上游不发尾帧。
+        object.insert(
+            "stream_options".to_owned(),
+            json!({"include_usage": true}),
+        );
         object.insert("messages".to_owned(), Value::Array(self.messages.clone()));
 
         if let Some(tools) = &self.tools

@@ -83,6 +83,8 @@ enum ServerPlan {
     LateCandidateCleanupFailure,
     CallError,
     LargeResult(usize),
+    /// `_meta["purelab/display"]` 超过 64KB 显示上限但 body 未超 1MiB。
+    DisplayMetaOversize,
     LargeContentLength(usize),
     LargeChunked(usize),
     SseNotificationThenResponse,
@@ -725,6 +727,7 @@ fn serve_http_request(
                 ServerPlan::CallError
                 | ServerPlan::DelayCall
                 | ServerPlan::LargeResult(_)
+                | ServerPlan::DisplayMetaOversize
                 | ServerPlan::LargeContentLength(_)
                 | ServerPlan::LargeChunked(_)
                 | ServerPlan::SseNotificationThenResponse
@@ -823,6 +826,23 @@ fn serve_http_request(
                     json_rpc_result(
                         request_id(body),
                         json!({"content": [{"type": "text", "text": text}], "isError": false}),
+                    ),
+                    true,
+                );
+            }
+            ServerPlan::DisplayMetaOversize => {
+                // 超 64KB 显示上限的 display 只丢字段；正常 content 必须照常返回。
+                let blob = "x".repeat(100 * 1024);
+                write_json_response(
+                    stream,
+                    200,
+                    json_rpc_result(
+                        request_id(body),
+                        json!({
+                            "content": [{"type": "text", "text": "ok"}],
+                            "isError": false,
+                            "_meta": {"purelab/display": {"v": 1, "type": "tag_card", "blob": blob}}
+                        }),
                     ),
                     true,
                 );
@@ -2985,6 +3005,20 @@ async fn output_over_one_mib_fails_closed_without_returning_payload() {
         .await
         .expect_err("超过 1 MiB 的 MCP 结果必须拒绝");
     assert_eq!(error.code(), "mcp_output_too_large");
+}
+
+#[tokio::test]
+async fn oversized_display_meta_drops_field_but_keeps_content() {
+    // display 超过 64KB 显示上限时只丢字段；正常 content 不被整对象大小限制拖垮。
+    let server = MockMcpServer::start(ServerPlan::DisplayMetaOversize);
+    let runtime = runtime_with_server("display", &server, ["display__ok"]).await;
+    let result = runtime
+        .call("display__ok", json!({}))
+        .await
+        .expect("超大 display 不得使整次调用失败");
+    assert_eq!(result.text_content(), Some("ok"));
+    assert!(result.display.is_none(), "超限 display 必须被丢弃");
+    runtime.shutdown().await.expect("session 必须可关闭");
 }
 
 #[tokio::test]

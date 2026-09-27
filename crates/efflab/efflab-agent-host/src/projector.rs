@@ -769,9 +769,13 @@ fn tool_display(update: &Map<String, Value>, session: &mut SessionProjection) ->
 }
 
 /// 返回 display 载荷被拒的固定原因码；空串表示通过。
+/// 形状与 sidecar `sanitize_display_value` 对齐：必须是含 `v`/`type` 的 object。
 fn tool_display_rejection_reason(display: &Value) -> &'static str {
-    if !display.is_object() {
+    let Some(object) = display.as_object() else {
         return "not_object";
+    };
+    if !object.contains_key("v") || !object.contains_key("type") {
+        return "missing_v_or_type";
     }
     match serde_json::to_vec(display) {
         Ok(bytes) if bytes.len() > MAX_TOOL_DISPLAY_BYTES => return "too_large",
@@ -814,11 +818,14 @@ fn tool_display_absolute_path(text: &str) -> bool {
     let bytes = text.as_bytes();
     for (offset, character) in text.char_indices() {
         let next_offset = offset + character.len_utf8();
+        // 首字符即 `/`/`\\` 时，无论后续是空白还是字符串结束都按绝对路径
+        // 处理（POSIX `/`、`/ a` 与 UNC 根形态），中段斜杠规则不变。
         if matches!(character, '/' | '\\')
-            && bytes
-                .get(next_offset)
-                .is_some_and(|next| !next.is_ascii_whitespace())
-            && tool_display_path_boundary(text[..offset].chars().next_back())
+            && (offset == 0
+                || (bytes
+                    .get(next_offset)
+                    .is_some_and(|next| !next.is_ascii_whitespace())
+                    && tool_display_path_boundary(text[..offset].chars().next_back())))
         {
             return true;
         }
@@ -830,15 +837,22 @@ fn tool_display_absolute_path(text: &str) -> bool {
         {
             return true;
         }
-        if character == ':'
-            && offset >= 4
-            && text[offset - 4..offset].eq_ignore_ascii_case("file")
-            && tool_display_path_boundary(text[..offset - 4].chars().next_back())
-        {
+        // 逐字符回溯 `file` 词根，避免非 ASCII 文本内字节切片 panic。
+        if character == ':' && tool_display_ends_with_file_token(&text[..offset]) {
             return true;
         }
     }
     false
+}
+
+/// 判断 `:` 前的文本是否以文本边界对齐的 `file` 词根结尾（大小写不敏感）；
+/// 只按字符迭代，不跨 UTF-8 边界切片。
+fn tool_display_ends_with_file_token(head: &str) -> bool {
+    let mut chars = head.chars().rev();
+    let token_matches = ['e', 'l', 'i', 'f']
+        .into_iter()
+        .all(|want| chars.next().is_some_and(|got| got.eq_ignore_ascii_case(&want)));
+    token_matches && tool_display_path_boundary(chars.next())
 }
 
 /// 路径起点只能出现在开头或文本边界，Unicode 字母/数字后的斜杠属于正文。

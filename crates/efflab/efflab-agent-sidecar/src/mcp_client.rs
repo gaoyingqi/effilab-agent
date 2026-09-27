@@ -4119,13 +4119,17 @@ fn is_tool_name_segment(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// 将 rmcp 风格的 call result 限制在 1 MiB 后转换为本地 DTO。
+/// 将 rmcp 风格的 call result 转换为本地有界 DTO。display 先于总大小限制
+/// 提取并单独校验（≤64KB，超限即丢弃），巨大 `_meta` 不再拖垮正常 content；
+/// 1 MiB 上限只施加在最终保留的 content/structuredContent 上。
 fn normalize_call_result(result: Value) -> Result<McpCallResult, McpError> {
-    let output_bytes = serde_json::to_vec(&result).map_err(|_| McpError::CallFailed)?;
-    if output_bytes.len() > MAX_MCP_OUTPUT_BYTES {
-        return Err(McpError::OutputTooLarge);
-    }
     let object = result.as_object().ok_or(McpError::CallFailed)?;
+    // 先独立提取显示载荷：校验失败只丢字段，与 content 成败解耦。
+    let display = object
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("purelab/display"))
+        .and_then(sanitize_display_value);
     let content = object
         .get("content")
         .and_then(Value::as_array)
@@ -4136,15 +4140,21 @@ fn normalize_call_result(result: Value) -> Result<McpCallResult, McpError> {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err(McpError::CallFailed),
     };
+    let structured_content = object.get("structuredContent").cloned();
+    // 只物化保留字段；display 已有独立上限且不入模型输入，不参与此处计量。
+    let content_bytes = serde_json::to_vec(&content).map_err(|_| McpError::CallFailed)?;
+    let structured_bytes = match &structured_content {
+        Some(value) => serde_json::to_vec(value).map_err(|_| McpError::CallFailed)?,
+        None => Vec::new(),
+    };
+    if content_bytes.len().saturating_add(structured_bytes.len()) > MAX_MCP_OUTPUT_BYTES {
+        return Err(McpError::OutputTooLarge);
+    }
     Ok(McpCallResult {
         content,
-        structured_content: object.get("structuredContent").cloned(),
+        structured_content,
         is_error,
-        display: object
-            .get("_meta")
-            .and_then(Value::as_object)
-            .and_then(|meta| meta.get("purelab/display"))
-            .and_then(sanitize_display_value),
+        display,
     })
 }
 
@@ -4225,11 +4235,14 @@ fn contains_absolute_path_string(text: &str) -> bool {
     let bytes = text.as_bytes();
     for (offset, character) in text.char_indices() {
         let next_offset = offset + character.len_utf8();
+        // 首字符即 `/`/`\\` 时，无论后续是空白还是字符串结束都按绝对路径
+        // 处理（POSIX `/`、`/ a` 与 UNC 根形态），中段斜杠规则不变。
         if matches!(character, '/' | '\\')
-            && bytes
-                .get(next_offset)
-                .is_some_and(|next| !next.is_ascii_whitespace())
-            && is_path_boundary(text[..offset].chars().next_back())
+            && (offset == 0
+                || (bytes
+                    .get(next_offset)
+                    .is_some_and(|next| !next.is_ascii_whitespace())
+                    && is_path_boundary(text[..offset].chars().next_back())))
         {
             return true;
         }
@@ -4243,16 +4256,22 @@ fn contains_absolute_path_string(text: &str) -> bool {
             return true;
         }
         // `file:` URI（含 file://、file:relative）；`file` 必须在起点或文本边界后，
-        // `myfile:` 这类结尾词根不误伤。
-        if character == ':'
-            && offset >= 4
-            && text[offset - 4..offset].eq_ignore_ascii_case("file")
-            && is_path_boundary(text[..offset - 4].chars().next_back())
-        {
+        // `myfile:` 这类结尾词根不误伤。逐字符回溯，避免非 ASCII 文本内字节切片 panic。
+        if character == ':' && ends_with_file_token(&text[..offset]) {
             return true;
         }
     }
     false
+}
+
+/// 判断 `:` 前的文本是否以文本边界对齐的 `file` 词根结尾（大小写不敏感）；
+/// 只按字符迭代，不跨 UTF-8 边界切片。
+fn ends_with_file_token(head: &str) -> bool {
+    let mut chars = head.chars().rev();
+    let token_matches = ['e', 'l', 'i', 'f']
+        .into_iter()
+        .all(|want| chars.next().is_some_and(|got| got.eq_ignore_ascii_case(&want)));
+    token_matches && is_path_boundary(chars.next())
 }
 
 /// 路径起点只能出现在开头或文本边界，正文内的斜杠/盘符形态不误伤。
@@ -4360,5 +4379,87 @@ mod tests {
             "file": "kick.wav"
         });
         assert!(sanitize_display_value(&value).is_some());
+    }
+
+    #[test]
+    fn display_rejects_root_slash_forms_at_string_start() {
+        // 首字符 `/`/`\\` 后跟空白或字符串结束同样是 POSIX/UNC 绝对路径根。
+        for path in ["/", "\\", "/ My Music/a.wav", "/ ", "\\ shared"] {
+            let value = json!({"v": 1, "type": "x", "path": path});
+            assert!(
+                sanitize_display_value(&value).is_none(),
+                "首字符绝对路径根应被拒绝: {path:?}"
+            );
+        }
+        // object key 同样覆盖。
+        for key in ["/", "\\", "/ My Music"] {
+            let value = json!({"v": 1, "type": "x", key: 1});
+            assert!(
+                sanitize_display_value(&value).is_none(),
+                "首字符绝对路径 object key 应被拒绝: {key:?}"
+            );
+        }
+        // 词内斜杠（前字符为字母数字）与含空格正文不误伤。
+        let prose = json!({"v": 1, "type": "x", "subtitle": "drums/percussion loop, ratio 3:2"});
+        assert!(sanitize_display_value(&prose).is_some());
+    }
+
+    #[test]
+    fn display_path_checks_never_panic_on_non_ascii() {
+        // `:` 前 4 字节落在多字节字符内部时，旧实现字节切片会 panic；
+        // 逐字符回溯后 `éabc:`/`éfile:` 与 ASCII 词根语义一致。
+        for (text, rejected) in [
+            ("éabc:", false),
+            ("xéfil:", false),
+            ("éfile: ./x.wav", false),
+            ("fichier file: ./x.wav", true),
+            ("FILE: secret.wav", true),
+            ("见 file:secret.wav", true),
+            ("kick.wav", false),
+        ] {
+            let value = json!({"v": 1, "type": "x", "note": text});
+            assert_eq!(
+                sanitize_display_value(&value).is_none(),
+                rejected,
+                "非 ASCII 文本的 file: 判定不一致: {text:?}"
+            );
+        }
+        // object key 覆盖非 ASCII + 冒号组合。
+        let keyed = json!({"v": 1, "type": "x", "éfile: label": 1});
+        assert!(sanitize_display_value(&keyed).is_some());
+        let keyed_bad = json!({"v": 1, "type": "x", "见 file:x": 1});
+        assert!(sanitize_display_value(&keyed_bad).is_none());
+    }
+
+    #[test]
+    fn oversized_display_drops_field_but_keeps_content() {
+        // display 单独超限（>64KB）时只丢字段；content 即使总和未超 1MiB 也保留。
+        let big = "x".repeat(100 * 1024);
+        let result = normalize_call_result(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "isError": false,
+            "_meta": {"purelab/display": {"v": 1, "type": "tag_card", "blob": big}}
+        }))
+        .expect("超大 display 不得拖垮正常 content");
+        assert!(result.display.is_none());
+        assert_eq!(result.text_content(), Some("ok"));
+    }
+
+    #[test]
+    fn meta_alone_over_one_mib_no_longer_fails_content() {
+        // 不计入保留字段的 `_meta` 不再触发 1MiB 整对象拒绝；content 超限仍拒绝。
+        let meta_blob = "m".repeat(MAX_MCP_OUTPUT_BYTES);
+        let result = normalize_call_result(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "_meta": {"purelab/other": meta_blob}
+        }))
+        .expect("不保留的 _meta 超限不得再拒绝 content");
+        assert_eq!(result.text_content(), Some("ok"));
+        let oversized_content = "y".repeat(MAX_MCP_OUTPUT_BYTES);
+        let error = normalize_call_result(json!({
+            "content": [{"type": "text", "text": oversized_content}],
+        }))
+        .expect_err("content 自身超 1MiB 仍必须拒绝");
+        assert_eq!(error, McpError::OutputTooLarge);
     }
 }
