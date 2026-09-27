@@ -1,0 +1,1 @@
+{"schema_version":1,"scope_id":"s","session_id":"sid","turn_id":"t","submission_id":"t","event_id":"e","sequence":3,"origin":"live","block_id":"call-1","block":{"kind":"tool","tool_call_id":"call-1","name":"purelab__tag_preview","detail":"mcp tool completed","status":"completed","display":{"v":1,"type":"tag_card","title":"Ambient Pad","fields":{"genre":"ambient","count":12}}}}

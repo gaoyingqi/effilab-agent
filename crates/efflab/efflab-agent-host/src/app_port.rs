@@ -289,6 +289,12 @@ pub trait HostApp: Send + Sync {
     fn mentions(&self) -> Option<&dyn HostAppMentions> {
         None
     }
+
+    /// 观察一个 turn 的模型 token 用量；仅供产品内部遥测/配额记账。
+    ///
+    /// 该回调由 `x.ai/turn_usage` 内部通知触发，不进入 Kit wire、session
+    /// journal 或产品事件流。默认空实现保证现有 HostApp 实现向后兼容。
+    fn observe_turn_usage(&self, _scope_id: &str, _session_id: &str, _usage: &crate::TurnUsage) {}
 }
 
 /// 产品按领域解析 `@` mention 的独立端口。

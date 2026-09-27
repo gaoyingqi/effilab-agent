@@ -63,6 +63,8 @@ struct SessionProjection {
     tools: BTreeMap<String, ToolSnapshot>,
     /// 真实 ACP 流可能让 ToolCallUpdate 先于 ToolCall 到达，先暂存可覆盖字段。
     orphan_tool_updates: BTreeMap<String, PendingToolUpdate>,
+    /// 已内部化的不合规 display 载荷计数；不进 Kit 语义，只供日志。
+    dropped_display_payloads: u64,
 }
 
 /// 流式文本块的稳定 block_id、所属 prompt 与累计文本。
@@ -77,6 +79,8 @@ struct ToolSnapshot {
     name: String,
     detail: String,
     status: ToolStatus,
+    /// 已校验的产品显示载荷；缺省为 None，对旧消费方无影响。
+    display: Option<Value>,
 }
 
 /// 区分状态字段的缺失、已知值和未知值，避免部分 update 覆盖已有状态。
@@ -93,11 +97,18 @@ struct PendingToolUpdate {
     name: Option<String>,
     detail: Option<String>,
     status: Option<ToolStatus>,
+    display: Option<Value>,
 }
 
 impl PendingToolUpdate {
     /// 仅记录本条 update 实际出现的字段，保持 ACP 的部分更新语义。
-    fn record(&mut self, title: Option<&str>, detail: Option<String>, status: ToolStatusField) {
+    fn record(
+        &mut self,
+        title: Option<&str>,
+        detail: Option<String>,
+        status: ToolStatusField,
+        display: Option<Value>,
+    ) {
         if let Some(title) = title {
             self.name = Some(title.to_string());
         }
@@ -106,6 +117,9 @@ impl PendingToolUpdate {
         }
         if let ToolStatusField::Known(status) = status {
             self.status = Some(status);
+        }
+        if let Some(display) = display {
+            self.display = Some(display);
         }
     }
 
@@ -120,6 +134,9 @@ impl PendingToolUpdate {
         if let Some(status) = self.status {
             tool.status = status;
         }
+        if let Some(display) = self.display {
+            tool.display = Some(display);
+        }
     }
 
     /// 没有完整 ToolCall 时也必须输出冻结 Tool 块，缺省字段采用安全占位。
@@ -128,6 +145,7 @@ impl PendingToolUpdate {
             name: self.name.clone().unwrap_or_default(),
             detail: self.detail.clone().unwrap_or_default(),
             status: self.status.unwrap_or(ToolStatus::Pending),
+            display: self.display.clone(),
         }
     }
 }
@@ -523,6 +541,7 @@ fn project_tool_call(
             .to_string(),
         detail: tool_detail(update).unwrap_or_default(),
         status,
+        display: tool_display(update, session),
     };
     // codegen 的 tracker 明确处理 update 先到的竞态；已出现字段覆盖迟到的基础调用。
     if let Some(orphan) = session.orphan_tool_updates.remove(tool_call_id) {
@@ -566,6 +585,8 @@ fn project_tool_call_update(
     session.clear_text_snapshots();
     let title = optional_string(update, "title");
     let detail = tool_detail(update);
+    // rawOutput.display 的产品显示载荷在投影边界再次校验；不合规只丢字段。
+    let display = tool_display(update, session);
     let block = if let Some(tool) = session.tools.get_mut(tool_call_id) {
         if let Some(title) = title {
             tool.name = title.to_string();
@@ -576,6 +597,9 @@ fn project_tool_call_update(
         if let ToolStatusField::Known(status) = parsed_status {
             tool.status = status;
         }
+        if let Some(display) = display {
+            tool.display = Some(display);
+        }
         tool_block(tool_call_id, tool)
     } else {
         // 尚无完整 ToolCall 时保留逐字段覆盖信息，供迟到的基础调用合并。
@@ -583,7 +607,7 @@ fn project_tool_call_update(
             .orphan_tool_updates
             .entry(tool_call_id.to_string())
             .or_default();
-        orphan.record(title, detail, parsed_status);
+        orphan.record(title, detail, parsed_status, display);
         let tool = orphan.display_snapshot();
         tool_block(tool_call_id, &tool)
     };
@@ -711,6 +735,117 @@ fn tool_block(tool_call_id: &str, tool: &ToolSnapshot) -> KitBlock {
         name: tool.name.clone(),
         detail: tool.detail.clone(),
         status: tool.status,
+        display: tool.display.clone(),
+    }
+}
+
+/// display 显示载荷的序列化上限与容器嵌套上限，与 sidecar 提取侧一致。
+const MAX_TOOL_DISPLAY_BYTES: usize = 64 * 1024;
+const MAX_TOOL_DISPLAY_DEPTH: usize = 16;
+
+/// 提取并兜底校验 `rawOutput.display`：必须是 object、≤64KB、嵌套 ≤16 层，
+/// 且字符串（含 object key）不含 POSIX 根/盘符/UNC/file: 绝对路径。
+/// 不合规只丢字段并记 actor-local 计数；缺失与校验失败都无法区分地返回 None。
+fn tool_display(update: &Map<String, Value>, session: &mut SessionProjection) -> Option<Value> {
+    let display = update
+        .get("rawOutput")
+        .and_then(Value::as_object)
+        .and_then(|raw| raw.get("display"))?;
+    let reason = tool_display_rejection_reason(display);
+    if reason.is_empty() {
+        return Some(display.clone());
+    }
+    session.dropped_display_payloads = session.dropped_display_payloads.saturating_add(1);
+    let total = session.dropped_display_payloads;
+    // 首条与 2 的幂间隔记录，避免恶意 sidecar 刷屏。
+    if total == 1 || (total.is_power_of_two() && total < u64::MAX) {
+        tracing::debug!(
+            reason,
+            dropped_display_payloads = total,
+            "已丢弃不合规的 rawOutput.display 显示载荷"
+        );
+    }
+    None
+}
+
+/// 返回 display 载荷被拒的固定原因码；空串表示通过。
+fn tool_display_rejection_reason(display: &Value) -> &'static str {
+    if !display.is_object() {
+        return "not_object";
+    }
+    match serde_json::to_vec(display) {
+        Ok(bytes) if bytes.len() > MAX_TOOL_DISPLAY_BYTES => return "too_large",
+        Err(_) => return "unserializable",
+        _ => {}
+    }
+    if !tool_display_value_clean(display, 0) {
+        return "depth_or_absolute_path";
+    }
+    ""
+}
+
+/// 递归检查容器深度与所有字符串（含 object key）不含绝对路径形态。
+fn tool_display_value_clean(value: &Value, depth: usize) -> bool {
+    match value {
+        Value::Array(items) => {
+            if depth >= MAX_TOOL_DISPLAY_DEPTH {
+                return false;
+            }
+            items
+                .iter()
+                .all(|item| tool_display_value_clean(item, depth + 1))
+        }
+        Value::Object(map) => {
+            if depth >= MAX_TOOL_DISPLAY_DEPTH {
+                return false;
+            }
+            map.iter().all(|(key, item)| {
+                !tool_display_absolute_path(key) && tool_display_value_clean(item, depth + 1)
+            })
+        }
+        Value::String(text) => !tool_display_absolute_path(text),
+        _ => true,
+    }
+}
+
+/// 与 mention 路径检查同一规则：POSIX 根、Windows 盘符、UNC 与 file: URI
+/// 一律拒绝，斜杠只允许出现在起点或文本边界，且不依赖当前宿主平台。
+fn tool_display_absolute_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (offset, character) in text.char_indices() {
+        let next_offset = offset + character.len_utf8();
+        if matches!(character, '/' | '\\')
+            && bytes
+                .get(next_offset)
+                .is_some_and(|next| !next.is_ascii_whitespace())
+            && tool_display_path_boundary(text[..offset].chars().next_back())
+        {
+            return true;
+        }
+        if character.is_ascii_alphabetic()
+            && bytes.get(offset + 1) == Some(&b':')
+            && bytes
+                .get(offset + 2)
+                .is_some_and(|next| matches!(*next, b'/' | b'\\'))
+        {
+            return true;
+        }
+        if character == ':'
+            && offset >= 4
+            && text[offset - 4..offset].eq_ignore_ascii_case("file")
+            && tool_display_path_boundary(text[..offset - 4].chars().next_back())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 路径起点只能出现在开头或文本边界，Unicode 字母/数字后的斜杠属于正文。
+fn tool_display_path_boundary(previous: Option<char>) -> bool {
+    match previous {
+        None => true,
+        Some(character) => !character.is_alphanumeric() && !matches!(character, '_' | '-' | '.'),
     }
 }
 

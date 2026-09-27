@@ -457,6 +457,22 @@ pub enum ToolStatus {
     Cancelled,
 }
 
+/// 单次模型请求的 token 用量快照；由 sidecar 经 `x.ai/turn_usage` 内部通知
+/// 上报，只进 `HostApp::observe_turn_usage`，不进入 Kit wire、journal 或事件流。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnUsage {
+    /// 所属 turn 的 prompt id。
+    pub prompt_id: String,
+    /// 输入 token 数。
+    pub input_tokens: u64,
+    /// 输出 token 数。
+    pub output_tokens: u64,
+    /// 总 token 数。
+    pub total_tokens: u64,
+    /// 可选的上游成本信息；形状由产品端决定，本层不透传语义。
+    pub cost: Option<Value>,
+}
+
 /// Kit 事件块；未知 kind 会降级为 `Unknown`。
 #[derive(Debug, Clone, PartialEq)]
 pub enum KitBlock {
@@ -472,6 +488,9 @@ pub enum KitBlock {
         name: String,
         detail: String,
         status: ToolStatus,
+        /// 可选的产品显示载荷（`_meta["purelab/display"]` 的投影）；
+        /// 仅供 UI 渲染，旧消费方忽略本字段时行为完全不变。
+        display: Option<Value>,
     },
     /// 结构化错误块。
     Error(KitError),
@@ -542,12 +561,14 @@ impl Serialize for KitBlock {
                 name,
                 detail,
                 status,
+                display,
             } => ToolBlock {
                 kind: "tool".to_string(),
                 tool_call_id: tool_call_id.clone(),
                 name: name.clone(),
                 detail: detail.clone(),
                 status: *status,
+                display: display.clone(),
             }
             .serialize(serializer),
             Self::Error(error) => ErrorBlock {
@@ -851,6 +872,9 @@ struct ToolBlock {
     name: String,
     detail: String,
     status: ToolStatus,
+    /// 可选显示载荷；缺省与 None 等价，旧 wire 不含此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<Value>,
 }
 
 /// 内标 error block，错误字段直接平铺在 block 内。
@@ -1005,6 +1029,7 @@ impl From<ToolBlock> for KitBlock {
             name: block.name,
             detail: block.detail,
             status: block.status,
+            display: block.display,
         }
     }
 }

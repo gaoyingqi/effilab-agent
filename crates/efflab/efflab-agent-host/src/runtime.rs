@@ -67,6 +67,9 @@ const NOOP_TOOL: &str = "GrokBuild:efflab_noop";
 const MAX_PROMPT_CHARS: usize = 32_000;
 /// 用户可见的回合失败提示；不得出现 sidecar 等实现名词。
 const TURN_FAILED_USER_MESSAGE: &str = "Reply did not complete; please retry";
+/// sidecar usage 内部上报的逻辑方法名（wire 上是 `_x.ai/turn_usage`）；
+/// 该通知在投影前内部化，不进 Kit 事件、journal 或 analytics。
+const TURN_USAGE_METHOD: &str = "x.ai/turn_usage";
 
 /// 把 sidecar 稳定错误码转成用户可读提示，不暴露内部实现名词。
 fn turn_failure_user_message(code: &str) -> &'static str {
@@ -790,6 +793,7 @@ impl HostRuntime {
             self.mcp_catalog_timeout,
             self.load_timeout,
             approved_mcp,
+            Arc::clone(&self.app),
         );
         let name = format!("efflab-acp-{}", scope_id);
         let actor_finished = Arc::clone(&finished);
@@ -1601,6 +1605,8 @@ struct ScopeActor {
     acp: AcpRuntime,
     policy: HostPolicy,
     service: Arc<LlmChannelService>,
+    /// 产品领域端口；目前只承载 `x.ai/turn_usage` 的 observer 回调。
+    app: Arc<dyn HostApp>,
     sink: Arc<dyn KitEventSink>,
     receiver: Receiver<ActorCommand>,
     accepting: Arc<AtomicBool>,
@@ -1648,6 +1654,8 @@ struct ScopeActor {
     mcp_failed_sessions: BTreeSet<String>,
     terminal_turns: BTreeSet<(String, String)>,
     last_activity: Instant,
+    /// 已内部化的损坏 usage 通知计数；不属于 Kit 语义，只供日志。
+    dropped_usage_reports: u64,
     dead: bool,
     /// 显式 shutdown 已完成；run loop 必须在回执后退出而不是继续消费命令。
     exit_requested: bool,
@@ -1681,6 +1689,7 @@ impl ScopeActor {
         mcp_catalog_timeout: Duration,
         load_timeout: Duration,
         approved: ApprovedMcpSpec,
+        app: Arc<dyn HostApp>,
     ) -> Self {
         Self {
             projector: Projector::new(scope_id.clone()),
@@ -1688,6 +1697,7 @@ impl ScopeActor {
             acp,
             policy,
             service,
+            app,
             sink,
             receiver,
             accepting,
@@ -1720,6 +1730,7 @@ impl ScopeActor {
             mcp_failed_sessions: BTreeSet::new(),
             terminal_turns: BTreeSet::new(),
             last_activity: Instant::now(),
+            dropped_usage_reports: 0,
             dead: false,
             exit_requested: false,
             acp_shutdown_done: false,
@@ -1997,6 +2008,14 @@ impl ScopeActor {
             tracing::debug!(scope = %self.scope_id, "已丢弃不属于当前 load epoch 的 replay notification");
             return;
         }
+
+        // usage 内部通知在投影前内部化：只进 HostApp observer，不进 Kit wire、
+        // journal 回放流或 analytics 载荷。
+        if method == TURN_USAGE_METHOD {
+            self.observe_turn_usage(params);
+            return;
+        }
+
         match self.projector.apply_acp_notification(method, params) {
             Ok(events) => {
                 for event in events {
@@ -2027,6 +2046,54 @@ impl ScopeActor {
                 tracing::debug!(scope = %self.scope_id, "已跳过无法投影的 ACP notification");
             }
         }
+    }
+
+    /// 严格解析 `x.ai/turn_usage` 并回调产品 observer；解析失败只内部化，
+    /// 恶意/损坏的 usage 载荷绝不影响会话状态或事件流。
+    fn observe_turn_usage(&mut self, params: &Value) {
+        let usage = params.get("usage").and_then(Value::as_object);
+        let parsed = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .zip(params.get("promptId").and_then(Value::as_str))
+            .zip(usage)
+            .and_then(|((session_id, prompt_id), usage)| {
+                let input = usage.get("promptTokens")?.as_u64()?;
+                let output = usage.get("completionTokens")?.as_u64()?;
+                let total = usage
+                    .get("totalTokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| input.saturating_add(output));
+                Some((
+                    session_id.to_string(),
+                    prompt_id.to_string(),
+                    input,
+                    output,
+                    total,
+                ))
+            });
+        let Some((session_id, prompt_id, input_tokens, output_tokens, total_tokens)) = parsed
+        else {
+            self.dropped_usage_reports = self.dropped_usage_reports.saturating_add(1);
+            tracing::debug!(
+                scope = %self.scope_id,
+                dropped_usage_reports = self.dropped_usage_reports,
+                "已内部化无法解析的 x.ai/turn_usage 通知"
+            );
+            return;
+        };
+        self.app.observe_turn_usage(
+            &self.scope_id,
+            &session_id,
+            &crate::TurnUsage {
+                prompt_id,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cost: None,
+            },
+        );
     }
 
     /// 处理 M1 必须回复的 reverse RPC，权限选择只使用本次 options 中的精确 id。
@@ -4587,6 +4654,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         actor.last_activity = Instant::now() - Duration::from_secs(1);
@@ -4814,6 +4882,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         actor.last_activity = Instant::now() - Duration::from_secs(1);
@@ -4947,6 +5016,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         actor.last_activity = Instant::now() - Duration::from_secs(1);
@@ -5023,6 +5093,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
 
         std::io::Write::write_all(
@@ -5124,6 +5195,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::with_expected_tools(["purelab__search_tracks".to_string()]),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         let (reply, reply_receiver) = mpsc::sync_channel(1);
@@ -5339,6 +5411,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         let ticket = SendTicket::new();
@@ -5406,6 +5479,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         let ticket = SendTicket::new();
@@ -5509,6 +5583,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         let actor_finished = Arc::clone(&finished);
@@ -5600,6 +5675,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         actor.initialized = true;
         actor.last_activity = Instant::now() - Duration::from_secs(1);
@@ -5714,6 +5790,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
 
         let first = actor.cleanup_resources();
@@ -5789,6 +5866,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
 
         actor
@@ -6121,6 +6199,7 @@ done
             Duration::from_secs(1),
             Duration::from_secs(1),
             ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
         );
         let event_id = "session-a:host:error:0".to_string();
         actor.pending_terminal_events.insert(
@@ -6173,5 +6252,174 @@ done
             .next()
             .expect("outbox 必须保留 terminal event");
         assert_eq!(event.event.event_id, "session-a:host:error:0");
+    }
+
+    /// `x.ai/turn_usage` 内部通知只进 HostApp observer；不投影、不进事件流，
+    /// 也无法经 session/load replay 回放。
+    #[test]
+    fn turn_usage_notification_reaches_observer_not_event_stream() {
+        /// 记录 observer 回调的测试 HostApp；其余端口沿用 LifecycleTestApp。
+        struct UsageRecordingApp {
+            inner: LifecycleTestApp,
+            seen: Arc<Mutex<Vec<(String, String, crate::TurnUsage)>>>,
+        }
+
+        impl HostApp for UsageRecordingApp {
+            fn app_id(&self) -> &str {
+                self.inner.app_id()
+            }
+
+            fn persist_llm_channel(&self, config: &LlmChannelConfig) -> Result<()> {
+                self.inner.persist_llm_channel(config)
+            }
+
+            fn load_llm_channel(&self) -> Result<LlmChannelConfig> {
+                self.inner.load_llm_channel()
+            }
+
+            fn seal_secret(&self, plain: &[u8]) -> Result<SealedSecret> {
+                self.inner.seal_secret(plain)
+            }
+
+            fn unseal_secret(&self, sealed: &SealedSecret) -> Result<SecretGuard> {
+                self.inner.unseal_secret(sealed)
+            }
+
+            fn seal_llm_secret(
+                &self,
+                slot: LlmSecretSlot,
+                plain: &[u8],
+            ) -> Result<SealedSecret> {
+                self.inner.seal_llm_secret(slot, plain)
+            }
+
+            fn unseal_llm_secret(
+                &self,
+                slot: LlmSecretSlot,
+                sealed: &SealedSecret,
+            ) -> Result<SecretGuard> {
+                self.inner.unseal_llm_secret(slot, sealed)
+            }
+
+            fn mcp_for_scope(&self, scope: &ScopeId) -> Result<ApprovedMcpSpec> {
+                self.inner.mcp_for_scope(scope)
+            }
+
+            fn observe_turn_usage(
+                &self,
+                scope_id: &str,
+                session_id: &str,
+                usage: &crate::TurnUsage,
+            ) {
+                self.seen
+                    .lock()
+                    .expect("usage 记录锁必须可用")
+                    .push((scope_id.to_string(), session_id.to_string(), usage.clone()));
+            }
+        }
+
+        struct RecordingSink {
+            events: Arc<Mutex<Vec<KitProductEvent>>>,
+        }
+
+        impl KitEventSink for RecordingSink {
+            fn emit(&self, event: KitProductEvent) -> Result<()> {
+                self.events.lock().expect("测试事件锁必须可用").push(event);
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 usage observer 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Arc::new(UsageRecordingApp {
+            inner: LifecycleTestApp,
+            seen: Arc::clone(&seen),
+        });
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) = std::os::unix::net::UnixStream::pair()
+            .expect("usage observer 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(RecordingSink {
+                events: Arc::clone(&events),
+            }),
+            receiver,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(CleanupResult::default())),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+            app,
+        );
+        actor.initialized = true;
+
+        // 合法 usage 通知：observer 收到结构化 TurnUsage，事件流保持为空。
+        actor.handle_notification(
+            TURN_USAGE_METHOD,
+            &json!({
+                "sessionId": "session-a",
+                "promptId": "turn-1",
+                "usage": {
+                    "promptTokens": 291,
+                    "completionTokens": 32,
+                    "totalTokens": 323
+                }
+            }),
+        );
+        {
+            let seen = seen.lock().expect("usage 记录锁必须可用");
+            assert_eq!(seen.len(), 1, "observer 必须被调用一次");
+            assert_eq!(seen[0].0, "scope-a");
+            assert_eq!(seen[0].1, "session-a");
+            assert_eq!(seen[0].2.prompt_id, "turn-1");
+            assert_eq!(seen[0].2.input_tokens, 291);
+            assert_eq!(seen[0].2.output_tokens, 32);
+            assert_eq!(seen[0].2.total_tokens, 323);
+        }
+        assert!(
+            events.lock().expect("测试事件锁必须可用").is_empty(),
+            "usage 通知不得产生任何 Kit 产品事件"
+        );
+
+        // 损坏的 usage 通知：只内部化计数，不回调 observer。
+        actor.handle_notification(
+            TURN_USAGE_METHOD,
+            &json!({"sessionId": "session-a", "usage": {"promptTokens": "x"}}),
+        );
+        assert_eq!(
+            seen.lock().expect("usage 记录锁必须可用").len(),
+            1,
+            "损坏的 usage 通知不得触发 observer"
+        );
+        assert_eq!(actor.dropped_usage_reports, 1);
+        assert!(
+            events.lock().expect("测试事件锁必须可用").is_empty(),
+            "损坏的 usage 通知同样不得产生事件"
+        );
     }
 }

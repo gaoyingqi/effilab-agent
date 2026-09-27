@@ -17,6 +17,7 @@ use xai_acp_lib::AcpGatewaySender;
 use crate::mcp_client::{McpCallResult, McpCancellationToken, McpError, McpRuntime};
 use crate::model_client::{
     CancellationToken, HttpModelClient, ModelDelta, ModelError, ModelToolCall, ModelTurnRequest,
+    ModelUsage,
 };
 use crate::session_store::{
     MAX_RECORD_ID_BYTES, MAX_RECORD_LINE_BYTES, SessionError, SessionRecord, SessionRepository,
@@ -46,6 +47,9 @@ const TERMINAL_REFUSED: &str = "refused";
 const TERMINAL_MAX_TURN_REQUESTS: &str = "max_turn_requests";
 /// 单条 ACP update 等待同一 outgoing writer 完成的上限，避免 transport 异常卡住 turn。
 const NOTIFICATION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// usage 内部上报的 ACP ext notification 逻辑方法名；wire 上是 `_x.ai/turn_usage`，
+/// Host 在投影前内部化该通知，不进 Kit event、journal 或 analytics。
+const TURN_USAGE_METHOD: &str = "x.ai/turn_usage";
 // 为 JSON line 的记录类型、id 和结构字段预留空间，避免正文刚好达到 line 上限。
 const MAX_ASSISTANT_TEXT_BYTES: usize = MAX_RECORD_LINE_BYTES.saturating_sub(1024);
 
@@ -434,6 +438,10 @@ impl TurnLoop {
                         }
                     }
                     Ok(Some(ModelDelta::ToolCall(call))) => tool_calls.push(call),
+                    Ok(Some(ModelDelta::Usage(usage))) => {
+                        // usage 是尽力而为的内部遥测：上报失败只记日志，不影响回合。
+                        self.report_turn_usage(session_id, prompt_id, &usage).await;
+                    }
                     Ok(Some(ModelDelta::Done)) | Ok(None) => {
                         #[cfg(debug_assertions)]
                         if let Some(test_seam) = &self.test_seam {
@@ -647,6 +655,32 @@ impl TurnLoop {
         result.map_err(|_| TurnLoopError::Transport)
     }
 
+    /// 把模型 usage 经 ACP ext notification 上报 Host observer；该通道不进入
+    /// Kit wire、journal 或 analytics，失败只记日志，绝不影响回合成败。
+    async fn report_turn_usage(&self, session_id: &str, prompt_id: &str, usage: &ModelUsage) {
+        let params = match serde_json::value::to_raw_value(&json!({
+            "sessionId": session_id,
+            "promptId": prompt_id,
+            "usage": {
+                "promptTokens": usage.prompt_tokens,
+                "completionTokens": usage.completion_tokens,
+                "totalTokens": usage.total_tokens
+            }
+        })) {
+            Ok(params) => params,
+            Err(_) => return,
+        };
+        let notification = acp::ExtNotification::new(TURN_USAGE_METHOD, params.into());
+        let completion = self.gateway.forward_with_completion(notification);
+        let delivered = tokio::time::timeout(NOTIFICATION_DELIVERY_TIMEOUT, completion).await;
+        if !matches!(delivered, Ok(Ok(Ok(())))) {
+            tracing::debug!(
+                event = "turn_usage_report_failed",
+                "模型 usage 内部上报未完成写入；仅丢失遥测，回合继续"
+            );
+        }
+    }
+
     /// 生产固定 200k 窗口阈值；debug 测试可通过 seam 文件压低，不走环境变量。
     fn compact_threshold_tokens_for_turn(&self) -> u64 {
         #[cfg(debug_assertions)]
@@ -726,6 +760,8 @@ impl TurnLoop {
                 Ok(Some(ModelDelta::ToolCall(_))) => {
                     saw_tool_call = true;
                 }
+                // compaction 请求的 usage 不属于当前 turn，丢弃。
+                Ok(Some(ModelDelta::Usage(_))) => {}
                 Ok(Some(ModelDelta::Done)) | Ok(None) => break,
                 Err(ModelError::Cancelled) => return CompactOutcome::Cancelled,
                 Err(error) => {
@@ -789,6 +825,7 @@ impl TurnLoop {
     }
 
     /// 写入一条工具 journal；sequence 由 store 在 append 时盖章。
+    /// display 是已序列化并校验过的显示载荷文本，供 replay 还原富卡片。
     async fn persist_tool_record(
         &self,
         session_id: &str,
@@ -798,8 +835,9 @@ impl TurnLoop {
         name: &str,
         detail: &str,
         status: &str,
+        display: Option<String>,
     ) -> Result<(), TurnLoopError> {
-        let record = SessionRecord::tool_in_round(
+        let record = SessionRecord::tool_in_round_display(
             UNASSIGNED_SEQUENCE,
             prompt_id,
             round,
@@ -807,6 +845,7 @@ impl TurnLoop {
             name,
             detail,
             status,
+            display,
         );
         self.repository
             .append(session_id, std::slice::from_ref(&record))
@@ -829,6 +868,7 @@ impl TurnLoop {
                 &wire_call_id,
                 &name,
                 acp::ToolCallStatus::Failed,
+                None,
             )
             .await?;
             self.persist_tool_record(
@@ -839,6 +879,7 @@ impl TurnLoop {
                 &name,
                 MCP_TOOL_CANCELLED,
                 TERMINAL_CANCELLED,
+                None,
             )
             .await?;
         }
@@ -977,6 +1018,7 @@ impl TurnLoop {
                     &name,
                     MCP_TOOL_CANCELLED,
                     TERMINAL_CANCELLED,
+                    None,
                 )
                 .await?;
                 continue;
@@ -990,6 +1032,7 @@ impl TurnLoop {
                 &name,
                 "permission pending",
                 "pending",
+                None,
             )
             .await?;
             self.send_tool_call(session_id, prompt_id, &wire_call_id, &name)
@@ -1007,6 +1050,7 @@ impl TurnLoop {
                     &wire_call_id,
                     &name,
                     acp::ToolCallStatus::Failed,
+                    None,
                 )
                 .await?;
                 self.persist_tool_record(
@@ -1017,6 +1061,7 @@ impl TurnLoop {
                     &name,
                     MCP_TOOL_CANCELLED,
                     TERMINAL_CANCELLED,
+                    None,
                 )
                 .await?;
                 halt = Some(ToolRoundHalt::Cancelled);
@@ -1029,6 +1074,7 @@ impl TurnLoop {
                     &wire_call_id,
                     &name,
                     acp::ToolCallStatus::Failed,
+                    None,
                 )
                 .await?;
                 self.persist_tool_record(
@@ -1039,6 +1085,7 @@ impl TurnLoop {
                     &name,
                     "permission rejected",
                     "rejected",
+                    None,
                 )
                 .await?;
                 halt = Some(ToolRoundHalt::Refused);
@@ -1065,6 +1112,7 @@ impl TurnLoop {
                     &wire_call_id,
                     &name,
                     acp::ToolCallStatus::Failed,
+                    None,
                 )
                 .await?;
                 self.persist_tool_record(
@@ -1075,6 +1123,7 @@ impl TurnLoop {
                     &name,
                     MCP_TOOL_CANCELLED,
                     TERMINAL_CANCELLED,
+                    None,
                 )
                 .await?;
                 self.cancel_remaining_tools(
@@ -1093,16 +1142,17 @@ impl TurnLoop {
                 &wire_call_id,
                 &name,
                 acp::ToolCallStatus::InProgress,
+                None,
             )
             .await?;
 
-            let (model_result, journal_detail) = if name == NOOP_TOOL {
+            let (model_result, journal_detail, display) = if name == NOOP_TOOL {
                 // 内置 noop 没有副作用；permission 之后此处是唯一的执行点。
                 #[cfg(debug_assertions)]
                 if let Some(test_seam) = &self.test_seam {
                     test_seam.record_execution();
                 }
-                (TOOL_RESULT.to_owned(), TOOL_RESULT)
+                (TOOL_RESULT.to_owned(), TOOL_RESULT, None)
             } else {
                 let arguments = mcp_arguments.ok_or(TurnLoopError::ToolRejected)?;
                 match self.call_mcp(&name, arguments, cancellation).await {
@@ -1112,7 +1162,12 @@ impl TurnLoop {
                         } else {
                             MCP_TOOL_RESULT
                         };
-                        (safe_mcp_result_for_model(&result), detail)
+                        // display 已在 mcp_client 完成校验；它只给 UI，不进入模型结果。
+                        (
+                            safe_mcp_result_for_model(&result),
+                            detail,
+                            result.display.clone(),
+                        )
                     }
                     Err(McpError::CallCancelled | McpError::RuntimeShutdown) => {
                         self.send_tool_status(
@@ -1121,6 +1176,7 @@ impl TurnLoop {
                             &wire_call_id,
                             &name,
                             acp::ToolCallStatus::Failed,
+                            None,
                         )
                         .await?;
                         self.persist_tool_record(
@@ -1131,6 +1187,7 @@ impl TurnLoop {
                             &name,
                             MCP_TOOL_CANCELLED,
                             TERMINAL_CANCELLED,
+                            None,
                         )
                         .await?;
                         self.cancel_remaining_tools(
@@ -1148,12 +1205,16 @@ impl TurnLoop {
                             error_code = error.code(),
                             "MCP 工具调用失败，向模型返回固定结果"
                         );
-                        (MCP_TOOL_FAILURE.to_owned(), MCP_TOOL_FAILURE)
+                        (MCP_TOOL_FAILURE.to_owned(), MCP_TOOL_FAILURE, None)
                     }
                 }
             };
 
-            // journal 只保存固定摘要；MCP 的真实结果仅进入当前模型回合。
+            // journal 保存固定摘要与已校验的 display（序列化文本）；MCP 的真实结果
+            // 仍只进入当前模型回合。
+            let journal_display = display
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok());
             self.persist_tool_record(
                 session_id,
                 prompt_id,
@@ -1162,6 +1223,7 @@ impl TurnLoop {
                 &name,
                 journal_detail,
                 TERMINAL_COMPLETED,
+                journal_display,
             )
             .await?;
             self.send_tool_status(
@@ -1170,6 +1232,7 @@ impl TurnLoop {
                 &wire_call_id,
                 &name,
                 acp::ToolCallStatus::Completed,
+                display.as_ref(),
             )
             .await?;
 
@@ -1239,6 +1302,7 @@ impl TurnLoop {
     }
 
     /// 发送安全的 tool 状态更新；公开 detail 固定，不回显工具参数或模型正文。
+    /// 完成态可携带已校验的 display 显示载荷（raw_output.display），仅供 UI。
     async fn send_tool_status(
         &self,
         session_id: &str,
@@ -1246,10 +1310,17 @@ impl TurnLoop {
         tool_call_id: &str,
         tool_name: &str,
         status: acp::ToolCallStatus,
+        display: Option<&Value>,
     ) -> Result<(), TurnLoopError> {
-        let fields = acp::ToolCallUpdateFields::new()
+        let mut fields = acp::ToolCallUpdateFields::new()
             .title(tool_name.to_owned())
             .status(status);
+        // 显示载荷只随完成态下发；其他状态即使误传也不携带。
+        if status == acp::ToolCallStatus::Completed
+            && let Some(display) = display
+        {
+            fields = fields.raw_output(json!({"display": display}));
+        }
         let update =
             acp::ToolCallUpdate::new(tool_call_id.to_owned(), fields).meta(prompt_meta(prompt_id));
         let notification = acp::SessionNotification::new(

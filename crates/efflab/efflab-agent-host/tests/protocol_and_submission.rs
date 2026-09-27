@@ -10,8 +10,9 @@ use anyhow::Result;
 use efflab_agent_host::{
     ApprovedMcpSpec, HostApp, HostRuntime, HostRuntimeConfig, KitBlock, KitCommand, KitError,
     KitEventSink, KitProductEvent, KitReply, LlmChannelConfig, LlmChannelView, ResolvedMention,
-    ScopeId, SealedSecret, SecretGuard, ValidatedKitEventSink,
+    ScopeId, SealedSecret, SecretGuard, ToolStatus, ValidatedKitEventSink,
 };
+use serde_json::json;
 
 /// 构造仅供协议测试使用的运行时配置；骨架阶段不会访问这些路径。
 fn runtime_config() -> HostRuntimeConfig {
@@ -190,6 +191,37 @@ fn kit_block_unknown_kind_round_trips_to_unknown_shape() {
         round_trip["block"],
         serde_json::json!({ "kind": "unknown", "unknown_kind": "plan" })
     );
+}
+
+/// tool block 的 display 显示载荷是可选透传字段；缺失与不写完全等价。
+#[test]
+fn tool_block_display_round_trips_and_absent_omits_field() {
+    let raw = include_str!("fixtures/kit_wire/tool_display_event.json");
+    let event: KitProductEvent =
+        serde_json::from_str(raw).expect("含 display 的 tool block 必须可解码");
+    let KitBlock::Tool { display, .. } = &event.block else {
+        panic!("fixture 必须是 tool block");
+    };
+    assert_eq!(display.as_ref().and_then(|d| d.get("v")), Some(&json!(1)));
+    assert_eq!(
+        display.as_ref().and_then(|d| d.get("type")),
+        Some(&json!("tag_card"))
+    );
+
+    let round_trip = serde_json::to_value(&event).expect("tool block 必须可重序列化");
+    let expected: serde_json::Value = serde_json::from_str(raw).expect("golden 必须是 JSON");
+    assert_eq!(round_trip, expected);
+
+    // display 缺席时 wire 不写该字段，旧消费方行为不变。
+    let absent = KitBlock::Tool {
+        tool_call_id: "call-2".to_string(),
+        name: "purelab__noop".to_string(),
+        detail: String::new(),
+        status: ToolStatus::Completed,
+        display: None,
+    };
+    let value = serde_json::to_value(&absent).expect("无 display 的 tool block 必须可序列化");
+    assert!(value.get("display").is_none());
 }
 
 /// session 级状态事件可没有 turn/submission，并按 Host 事件 ID 合成规则编码。

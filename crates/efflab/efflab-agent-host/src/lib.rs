@@ -36,7 +36,7 @@ pub use projector::{ProjectError, Projector, apply_acp_notification};
 pub use protocol::{
     Capability, CapabilityLimits, KIT_SCHEMA_VERSION, KitBlock, KitCommand, KitError,
     KitProductEvent, KitProductEventValidationError, KitReply, LlmChannelKind, LlmChannelView,
-    Origin, SessionSummary, ToolStatus,
+    Origin, SessionSummary, ToolStatus, TurnUsage,
 };
 pub use runtime::HostRuntime;
 pub use supervisor::{

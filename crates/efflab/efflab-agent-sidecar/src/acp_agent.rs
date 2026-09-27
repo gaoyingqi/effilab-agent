@@ -755,18 +755,24 @@ impl MinimalAgent {
                     tool_call_id,
                     name,
                     status,
+                    display,
                     ..
                 } if latest_tools.get(tool_call_id) == Some(sequence)
                     && is_safe_transcript_tool_name(name) =>
                 {
                     let status = replay_tool_status(status);
-                    let update = acp::ToolCallUpdate::new(
-                        tool_call_id.clone(),
-                        acp::ToolCallUpdateFields::new()
-                            .title(name.clone())
-                            .status(status),
-                    )
-                    .meta(replay_prompt_meta(prompt_id));
+                    let mut fields = acp::ToolCallUpdateFields::new()
+                        .title(name.clone())
+                        .status(status);
+                    // 显示载荷随完成态回放还原；journal 中损坏的文本只丢字段不回放失败。
+                    if let Some(display) = display
+                        && status == acp::ToolCallStatus::Completed
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(display)
+                    {
+                        fields = fields.raw_output(serde_json::json!({"display": parsed}));
+                    }
+                    let update = acp::ToolCallUpdate::new(tool_call_id.clone(), fields)
+                        .meta(replay_prompt_meta(prompt_id));
                     Some(
                         acp::SessionNotification::new(
                             session.id.clone(),

@@ -241,6 +241,9 @@ pub enum SessionRecord {
         detail: String,
         /// 工具状态。
         status: String,
+        /// 已校验并序列化的 `_meta["purelab/display"]` 显示载荷文本；
+        /// 仅供 replay 还原富卡片，不进入模型 transcript。
+        display: Option<String>,
     },
     /// 一个 turn 的终态。
     TurnTerminal {
@@ -392,6 +395,30 @@ impl SessionRecord {
         detail: impl Into<String>,
         status: impl Into<String>,
     ) -> Self {
+        Self::tool_in_round_display(
+            sequence,
+            prompt_id,
+            round,
+            tool_call_id,
+            name,
+            detail,
+            status,
+            None,
+        )
+    }
+
+    /// 构造带显示载荷的工具摘要记录；display 必须已校验并序列化为 JSON 文本。
+    #[allow(clippy::too_many_arguments)]
+    pub fn tool_in_round_display(
+        sequence: u64,
+        prompt_id: impl Into<String>,
+        round: u32,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        status: impl Into<String>,
+        display: Option<String>,
+    ) -> Self {
         Self::Tool {
             sequence,
             prompt_id: prompt_id.into(),
@@ -400,6 +427,7 @@ impl SessionRecord {
             name: name.into(),
             detail: detail.into(),
             status: status.into(),
+            display,
         }
     }
 
@@ -1998,12 +2026,19 @@ fn validate_record(record: &SessionRecord) -> Result<(), SessionError> {
             name,
             detail,
             status,
+            display,
             ..
         } => {
             validate_identifier(tool_call_id)?;
             validate_identifier(name)?;
             validate_identifier(status)?;
-            validate_text_size(detail)
+            validate_text_size(detail)?;
+            // display 是已序列化的显示载荷：形状校验在 mcp_client 提取与 Host
+            // 投影处完成，这里只保证它是可解析且受限的 JSON 文本。
+            if let Some(display) = display {
+                validate_display_text(display)?;
+            }
+            Ok(())
         }
         SessionRecord::TurnTerminal { status, .. } => validate_identifier(status),
         SessionRecord::CompactSummary { text, .. } => {
@@ -2012,6 +2047,21 @@ fn validate_record(record: &SessionRecord) -> Result<(), SessionError> {
             }
             validate_text_size(text)
         }
+    }
+}
+
+/// 校验 journal 中的 display 载荷文本：必须可解析为含 `v`/`type` 的 object，
+/// 且不超过 MCP 显示载荷的 64KB 上限；路径/深度安全由提取与投影侧负责。
+fn validate_display_text(display: &str) -> Result<(), SessionError> {
+    if display.len() > crate::mcp_client::MAX_MCP_DISPLAY_BYTES {
+        return Err(SessionError::InvalidRecord);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(display) else {
+        return Err(SessionError::InvalidRecord);
+    };
+    match value.as_object() {
+        Some(object) if object.contains_key("v") && object.contains_key("type") => Ok(()),
+        _ => Err(SessionError::InvalidRecord),
     }
 }
 
@@ -3315,6 +3365,9 @@ enum PersistedRecord {
         name: String,
         detail: String,
         status: String,
+        /// 可选显示载荷；旧 journal 无此字段，向后兼容。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
     },
     /// turn 终态 wire。
     TurnTerminal {
@@ -3391,6 +3444,7 @@ impl TryFrom<&SessionRecord> for PersistedRecord {
                 name,
                 detail,
                 status,
+                display,
             } => Self::Tool {
                 schema_version: SCHEMA_VERSION,
                 sequence: *sequence,
@@ -3400,6 +3454,7 @@ impl TryFrom<&SessionRecord> for PersistedRecord {
                 name: name.clone(),
                 detail: detail.clone(),
                 status: status.clone(),
+                display: display.clone(),
             },
             SessionRecord::TurnTerminal {
                 sequence,
@@ -3500,6 +3555,7 @@ impl TryFrom<PersistedRecord> for SessionRecord {
                 name,
                 detail,
                 status,
+                display,
             } => {
                 if schema_version != SCHEMA_VERSION {
                     return Err(SessionError::Corrupt);
@@ -3512,6 +3568,7 @@ impl TryFrom<PersistedRecord> for SessionRecord {
                     name,
                     detail,
                     status,
+                    display,
                 }
             }
             PersistedRecord::TurnTerminal {

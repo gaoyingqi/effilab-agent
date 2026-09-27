@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::mock_l3b::{MockL3b, MockResponse};
 use efflab_agent_sidecar::model_client::{
     CancellationToken, HttpModelClient, ModelDelta, ModelError, ModelToolCall, ModelTurnRequest,
+    ModelUsage,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -308,7 +309,7 @@ async fn emits_thought_before_text_when_same_delta_carries_both() {
 }
 
 #[tokio::test]
-async fn ignores_trailing_usage_chunk_with_empty_choices() {
+async fn parses_trailing_usage_chunk_with_empty_choices() {
     let body = concat!(
         r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"role":null,"content":"吗？😊","reasoning_content":null,"tool_calls":null}}]}"#,
         "\n\n",
@@ -324,6 +325,36 @@ async fn ignores_trailing_usage_chunk_with_empty_choices() {
         .await
         .expect("创建模型 SSE stream");
     assert_eq!(next_text(&mut stream).await, "吗？😊");
+    // usage 尾帧解析为结构化 delta；不进模型续写也不进 journal。
+    assert_eq!(
+        stream.recv().await.expect("读取 usage delta"),
+        Some(ModelDelta::Usage(ModelUsage {
+            prompt_tokens: 291,
+            completion_tokens: 32,
+            total_tokens: 323,
+        }))
+    );
+    assert_eq!(
+        stream.recv().await.expect("读取 DONE"),
+        Some(ModelDelta::Done)
+    );
+}
+
+#[tokio::test]
+async fn ignores_malformed_usage_chunk_without_failing_stream() {
+    let body = concat!(
+        r#"data: {"choices":[{"delta":{"content":"ok"}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[],"usage":{"prompt_tokens":"291x"}}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = MockL3b::raw_sse_chunks([(body.as_bytes().to_vec(), Duration::ZERO)]);
+    let mut stream = client_for(&server)
+        .stream_turn(test_request(), CancellationToken::new())
+        .await
+        .expect("创建模型 SSE stream");
+    assert_eq!(next_text(&mut stream).await, "ok");
     assert_eq!(
         stream.recv().await.expect("读取 DONE"),
         Some(ModelDelta::Done)

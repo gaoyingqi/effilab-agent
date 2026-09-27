@@ -195,8 +195,22 @@ pub enum ModelDelta {
     Thought(String),
     /// 在 `[DONE]` 前按 index 聚合完成的工具调用。
     ToolCall(ModelToolCall),
+    /// 上游按 `include_usage` 返回的 token 用量；只上报 Host observer，
+    /// 不进入模型续写、journal 或 Kit wire。
+    Usage(ModelUsage),
     /// 上游正常结束。
     Done,
+}
+
+/// 单次模型请求的 token 用量快照（OpenAI 兼容 usage 字段名）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ModelUsage {
+    /// 输入 token 数。
+    pub prompt_tokens: u64,
+    /// 输出 token 数。
+    pub completion_tokens: u64,
+    /// 总 token 数。
+    pub total_tokens: u64,
 }
 
 /// 聚合后的 Chat Completions function tool call。
@@ -229,6 +243,12 @@ impl fmt::Debug for ModelDelta {
                 .field("id_present", &call.id.is_some())
                 .field("name_present", &call.name.is_some())
                 .field("arguments_length", &call.arguments.len())
+                .finish(),
+            Self::Usage(usage) => formatter
+                .debug_struct("ModelDelta::Usage")
+                .field("prompt_tokens", &usage.prompt_tokens)
+                .field("completion_tokens", &usage.completion_tokens)
+                .field("total_tokens", &usage.total_tokens)
                 .finish(),
             Self::Done => formatter.write_str("ModelDelta::Done"),
         }
@@ -907,6 +927,18 @@ impl ModelStream {
         let payload = serde_json::from_str::<Value>(data).map_err(|error| {
             model_contract_error("sse_json_parse", &format!("error={error}; frame={data}"))
         })?;
+        // OpenAI stream_options.include_usage：[DONE] 前有空 choices + usage 尾帧。
+        // usage 是尽力而为的遥测：解析失败只记日志，绝不打断 stream 或失败本回合。
+        if let Some(usage) = payload.get("usage").and_then(parse_usage_object) {
+            tracing::debug!(
+                event = "l3b_usage_frame",
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                total_tokens = usage.total_tokens,
+                "L3b 返回了 token 用量尾帧"
+            );
+            self.queued.push_back(ModelDelta::Usage(usage));
+        }
         let choices = match payload.get("choices") {
             None | Some(Value::Null) => {
                 tracing::debug!(
@@ -1108,6 +1140,24 @@ fn first_delta_text(
             &format!("{field}={other}; frame={data}"),
         )),
     }
+}
+
+/// 尽力而为地解析 OpenAI 兼容 usage object；缺字段或非整数返回 None，
+/// 调用方只跳过上报，绝不让遥测数据影响回合成败。
+fn parse_usage_object(value: &Value) -> Option<ModelUsage> {
+    let object = value.as_object()?;
+    let prompt_tokens = object.get("prompt_tokens")?.as_u64()?;
+    let completion_tokens = object.get("completion_tokens")?.as_u64()?;
+    // total_tokens 缺省时按分量求和；上游一致提供时以 wire 值为准。
+    let total_tokens = object
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    Some(ModelUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    })
 }
 
 /// 解析一个工具调用片段；非 function 类型忽略，扩展键忽略。

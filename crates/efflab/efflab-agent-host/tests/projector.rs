@@ -131,13 +131,13 @@ fn maps_thinking_tool_and_user_echo_from_real_acp_shapes() {
     ));
     assert!(matches!(
         &tool_events[0].block,
-        KitBlock::Tool { tool_call_id, name, detail, status }
+        KitBlock::Tool { tool_call_id, name, detail, status, .. }
             if tool_call_id == "tool-1" && name == "bash" && detail.is_empty()
                 && *status == ToolStatus::Pending
     ));
     assert!(matches!(
         &update_events[0].block,
-        KitBlock::Tool { tool_call_id, name, detail, status }
+        KitBlock::Tool { tool_call_id, name, detail, status, .. }
             if tool_call_id == "tool-1" && name == "bash" && detail == "running"
                 && *status == ToolStatus::Running
     ));
@@ -781,4 +781,133 @@ fn projector_debug_redacts_projected_text_snapshots() {
         !debug.contains("tool-name-debug-secret") && !debug.contains("tool-detail-debug-secret"),
         "Projector Debug 不得回显工具快照文本"
     );
+}
+
+/// 完成态 tool_call_update 的 rawOutput.display 必须投影为 KitBlock::Tool.display。
+#[test]
+fn tool_call_update_raw_output_display_projects_to_tool_block() {
+    let mut projector = Projector::new("scope-1");
+    let meta = json!({ "promptId": "turn-1" });
+    let tool_call = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1",
+            "title": "purelab__tag_preview",
+            "status": "in_progress"
+        }),
+        meta.clone(),
+    );
+    let completed = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-1",
+            "status": "completed",
+            "rawOutput": {
+                "display": {"v": 1, "type": "tag_card", "title": "Ambient Pad"}
+            }
+        }),
+        meta,
+    );
+
+    let _ = apply_acp_notification(&mut projector, "session/update", &tool_call)
+        .expect("tool_call 必须可投影");
+    let events = apply_acp_notification(&mut projector, "session/update", &completed)
+        .expect("完成态 tool_call_update 必须可投影");
+
+    assert_valid(&events);
+    assert_eq!(events.len(), 1);
+    let KitBlock::Tool {
+        status, display, ..
+    } = &events[0].block
+    else {
+        panic!("必须是 tool block");
+    };
+    assert_eq!(*status, ToolStatus::Completed);
+    assert_eq!(
+        display.as_ref().and_then(|d| d.get("type")),
+        Some(&json!("tag_card"))
+    );
+    // display 只出现在 Tool block 的可选字段，不产生额外事件。
+    assert_eq!(events[0].block_id, "tool-1");
+}
+
+/// display 缺失时行为与旧版完全一致；非法载荷只丢字段不丢事件。
+#[test]
+fn tool_update_without_or_with_bad_display_keeps_tool_block() {
+    let mut projector = Projector::new("scope-1");
+    let meta = json!({ "promptId": "turn-1" });
+    let cases = [
+        json!({}),
+        json!({"rawOutput": {"display": "not-an-object"}}),
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "path": "/etc/passwd"}}}),
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "path": "C:\\Temp\\x.wav"}}}),
+        json!({"rawOutput": {"display": {"v": 1, "type": "x", "u": "file:///etc/x"}}}),
+    ];
+    for (index, extra) in cases.iter().enumerate() {
+        let mut update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": format!("tool-{index}"),
+            "status": "completed"
+        });
+        for (key, value) in extra.as_object().expect("case 必须是 object") {
+            update[key] = value.clone();
+        }
+        let events = apply_acp_notification(
+            &mut projector,
+            "session/update",
+            &tool_notification(update, meta.clone()),
+        )
+        .expect("display 非法时整条 update 不得失败");
+        assert_eq!(events.len(), 1);
+        let KitBlock::Tool {
+            status, display, ..
+        } = &events[0].block
+        else {
+            panic!("必须是 tool block");
+        };
+        assert_eq!(*status, ToolStatus::Completed);
+        assert!(display.is_none(), "不合规 display 必须被丢弃: {extra}");
+    }
+}
+
+/// display 先经孤儿 update 暂存，迟到的完整 tool_call 合并后仍保留载荷。
+#[test]
+fn orphan_tool_update_display_merges_into_late_tool_call() {
+    let mut projector = Projector::new("scope-1");
+    let meta = json!({ "promptId": "turn-1" });
+    let update = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-1",
+            "status": "completed",
+            "rawOutput": {
+                "display": {"v": 1, "type": "tag_card"}
+            }
+        }),
+        meta.clone(),
+    );
+    let call = tool_notification(
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1",
+            "title": "purelab__tag_preview",
+            "status": "in_progress"
+        }),
+        meta,
+    );
+
+    let update_events = apply_acp_notification(&mut projector, "session/update", &update)
+        .expect("孤儿 update 必须可投影");
+    let call_events = apply_acp_notification(&mut projector, "session/update", &call)
+        .expect("迟到 tool_call 必须可投影");
+
+    for events in [&update_events, &call_events] {
+        let KitBlock::Tool { display, .. } = &events[0].block else {
+            panic!("必须是 tool block");
+        };
+        assert_eq!(
+            display.as_ref().and_then(|d| d.get("type")),
+            Some(&json!("tag_card"))
+        );
+    }
 }

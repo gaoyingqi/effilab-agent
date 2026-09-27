@@ -32,6 +32,12 @@ pub const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// MCP 工具输出的最大序列化字节数。
 pub const MAX_MCP_OUTPUT_BYTES: usize = 1_048_576;
+/// `_meta["purelab/display"]` 显示载荷的序列化上限；仅供 UI 渲染，绝不进入模型输入。
+pub const MAX_MCP_DISPLAY_BYTES: usize = 64 * 1024;
+/// display 载荷的容器嵌套上限，与 journal 的 MAX_JSON_DEPTH 对齐。
+const MAX_MCP_DISPLAY_DEPTH: usize = 16;
+/// display 载荷校验失败的内部计数；不进入 wire、journal 或模型输入。
+static DROPPED_DISPLAY_PAYLOADS: AtomicU64 = AtomicU64::new(0);
 
 /// JSON-RPC 请求和响应在解码前的严格物化上限。
 const MAX_MCP_RESPONSE_BODY_BYTES: usize = MAX_MCP_OUTPUT_BYTES;
@@ -272,6 +278,9 @@ pub struct McpCallResult {
     pub structured_content: Option<Value>,
     /// MCP tool-level error 标记；这不是协议 transport error。
     pub is_error: bool,
+    /// `_meta["purelab/display"]` 的已校验显示载荷；serde skip 保证它绝不进入模型输入。
+    #[serde(skip)]
+    pub display: Option<Value>,
 }
 
 impl McpCallResult {
@@ -4131,6 +4140,11 @@ fn normalize_call_result(result: Value) -> Result<McpCallResult, McpError> {
         content,
         structured_content: object.get("structuredContent").cloned(),
         is_error,
+        display: object
+            .get("_meta")
+            .and_then(Value::as_object)
+            .and_then(|meta| meta.get("purelab/display"))
+            .and_then(sanitize_display_value),
     })
 }
 
@@ -4139,4 +4153,212 @@ fn serialized_call_result_size(result: &McpCallResult) -> usize {
     serde_json::to_vec(result)
         .map(|bytes| bytes.len())
         .unwrap_or(0)
+}
+
+/// 校验 `_meta["purelab/display"]` 显示载荷：必须是含 `v`/`type` 的 object，
+/// 序列化 ≤64KB、容器嵌套 ≤16 层，且字符串（含 object key）不携带绝对路径。
+/// 违规返回 None 并记内部计数；载荷仅供 UI 渲染，永不进入模型输入。
+pub(crate) fn sanitize_display_value(value: &Value) -> Option<Value> {
+    let reason = display_rejection_reason(value);
+    if reason.is_empty() {
+        return Some(value.clone());
+    }
+    let total = DROPPED_DISPLAY_PAYLOADS.fetch_add(1, Ordering::Relaxed) + 1;
+    // 首条与 2 的幂间隔记录，避免恶意 MCP server 刷屏；计数不离开本进程。
+    if total == 1 || (total.is_power_of_two() && total < u64::MAX) {
+        tracing::debug!(
+            event = "mcp_display_dropped",
+            reason,
+            dropped_display_payloads = total,
+            "已丢弃不合规的 purelab/display 显示载荷"
+        );
+    }
+    None
+}
+
+/// 返回 display 载荷被拒的固定原因码；空串表示通过。
+fn display_rejection_reason(value: &Value) -> &'static str {
+    let Some(object) = value.as_object() else {
+        return "not_object";
+    };
+    if !object.contains_key("v") || !object.contains_key("type") {
+        return "missing_v_or_type";
+    }
+    match serde_json::to_vec(value) {
+        Ok(bytes) if bytes.len() > MAX_MCP_DISPLAY_BYTES => return "too_large",
+        Err(_) => return "unserializable",
+        _ => {}
+    }
+    if !display_value_clean(value, 0) {
+        return "depth_or_absolute_path";
+    }
+    ""
+}
+
+/// 递归检查容器深度与所有字符串（含 object key）不含绝对路径形态。
+fn display_value_clean(value: &Value, depth: usize) -> bool {
+    match value {
+        Value::Array(items) => {
+            if depth >= MAX_MCP_DISPLAY_DEPTH {
+                return false;
+            }
+            items
+                .iter()
+                .all(|item| display_value_clean(item, depth + 1))
+        }
+        Value::Object(map) => {
+            if depth >= MAX_MCP_DISPLAY_DEPTH {
+                return false;
+            }
+            map.iter().all(|(key, item)| {
+                !contains_absolute_path_string(key) && display_value_clean(item, depth + 1)
+            })
+        }
+        Value::String(text) => !contains_absolute_path_string(text),
+        _ => true,
+    }
+}
+
+/// 检测 POSIX 根、Windows 盘符、UNC 与 file: URI，不依赖当前宿主平台。
+/// 与 Host mention 路径检查同一思路：斜杠只允许出现在起点或文本边界。
+fn contains_absolute_path_string(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (offset, character) in text.char_indices() {
+        let next_offset = offset + character.len_utf8();
+        if matches!(character, '/' | '\\')
+            && bytes
+                .get(next_offset)
+                .is_some_and(|next| !next.is_ascii_whitespace())
+            && is_path_boundary(text[..offset].chars().next_back())
+        {
+            return true;
+        }
+        // `X:/`、`X:\` 盘符形态（与 Host mention 检查同一规则）。
+        if character.is_ascii_alphabetic()
+            && bytes.get(offset + 1) == Some(&b':')
+            && bytes
+                .get(offset + 2)
+                .is_some_and(|next| matches!(*next, b'/' | b'\\'))
+        {
+            return true;
+        }
+        // `file:` URI（含 file://、file:relative）；`file` 必须在起点或文本边界后，
+        // `myfile:` 这类结尾词根不误伤。
+        if character == ':'
+            && offset >= 4
+            && text[offset - 4..offset].eq_ignore_ascii_case("file")
+            && is_path_boundary(text[..offset - 4].chars().next_back())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 路径起点只能出现在开头或文本边界，正文内的斜杠/盘符形态不误伤。
+fn is_path_boundary(previous: Option<char>) -> bool {
+    match previous {
+        None => true,
+        Some(character) => !character.is_alphanumeric() && !matches!(character, '_' | '-' | '.'),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_display() -> Value {
+        json!({
+            "v": 1,
+            "type": "tag_card",
+            "title": "Ambient Pad",
+            "fields": {"genre": "ambient", "keys": ["a", "b"]}
+        })
+    }
+
+    #[test]
+    fn display_extracted_from_meta_and_kept_out_of_model_result() {
+        let result = normalize_call_result(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "isError": false,
+            "_meta": {"purelab/display": valid_display()}
+        }))
+        .expect("含 display 的合法 MCP result 必须归一化");
+        assert_eq!(result.display, Some(valid_display()));
+        // display 不参与结构序列化，模型侧拿不到该字段。
+        let wire = serde_json::to_value(&result).expect("result 可序列化");
+        assert!(wire.get("display").is_none());
+        let encoded = serde_json::to_string(&result).expect("result 可序列化");
+        assert!(!encoded.contains("purelab/display"));
+    }
+
+    #[test]
+    fn display_absent_or_non_object_meta_is_ignored() {
+        let result = normalize_call_result(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "_meta": {"other": 1}
+        }))
+        .expect("无 display 的 MCP result 必须归一化");
+        assert!(result.display.is_none());
+    }
+
+    #[test]
+    fn display_rejects_non_object_and_missing_shape() {
+        assert!(sanitize_display_value(&json!("card")).is_none());
+        assert!(sanitize_display_value(&json!({"v": 1})).is_none());
+        assert!(sanitize_display_value(&json!({"type": "x"})).is_none());
+        assert!(sanitize_display_value(&valid_display()).is_some());
+    }
+
+    #[test]
+    fn display_rejects_oversize_payload() {
+        let big = "x".repeat(70 * 1024);
+        let value = json!({"v": 1, "type": "x", "blob": big});
+        assert!(sanitize_display_value(&value).is_none());
+    }
+
+    #[test]
+    fn display_rejects_deep_nesting() {
+        // 17 层容器嵌套超过 MAX_MCP_DISPLAY_DEPTH。
+        let mut value = json!("leaf");
+        for _ in 0..17 {
+            value = json!([value]);
+        }
+        let display = json!({"v": 1, "type": "x", "payload": value});
+        assert!(sanitize_display_value(&display).is_none());
+    }
+
+    #[test]
+    fn display_rejects_absolute_paths() {
+        for path in [
+            "/etc/passwd",
+            "/Volumes/work/x.wav",
+            "C:\\Users\\me\\x.wav",
+            "D:/samples/x.wav",
+            "\\\\server\\share\\x.wav",
+            "file:///etc/passwd",
+            "file:secret.wav",
+            "see /tmp/x.wav for details",
+        ] {
+            let value = json!({"v": 1, "type": "x", "path": path});
+            assert!(
+                sanitize_display_value(&value).is_none(),
+                "路径应被拒绝: {path}"
+            );
+        }
+        // object key 同样校验。
+        let keyed = json!({"v": 1, "type": "x", "/abs/key": 1});
+        assert!(sanitize_display_value(&keyed).is_none());
+    }
+
+    #[test]
+    fn display_allows_relative_and_inline_strings() {
+        let value = json!({
+            "v": 1,
+            "type": "tag_card",
+            "subtitle": "drums/percussion loop, ratio 3:2",
+            "file": "kick.wav"
+        });
+        assert!(sanitize_display_value(&value).is_some());
+    }
 }

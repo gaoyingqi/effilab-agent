@@ -259,6 +259,13 @@ mod task13 {
             reasoning: String,
             text: String,
         },
+        /// 正文响应在 [DONE] 前追加空 choices + usage 尾帧。
+        TextWithUsage {
+            text: String,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+            total_tokens: u64,
+        },
     }
 
     impl ScriptedResponse {
@@ -318,6 +325,21 @@ mod task13 {
             Self::ReasoningAndText {
                 reasoning: reasoning.into(),
                 text: text.into(),
+            }
+        }
+
+        /// 构造正文 + OpenAI include_usage 风格 usage 尾帧的 SSE 响应。
+        fn text_with_usage(
+            text: impl Into<String>,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+            total_tokens: u64,
+        ) -> Self {
+            Self::TextWithUsage {
+                text: text.into(),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
             }
         }
     }
@@ -435,6 +457,8 @@ mod task13 {
         address: std::net::SocketAddr,
         requests: Arc<Mutex<Vec<String>>>,
         call_count: Arc<AtomicUsize>,
+        /// 可选 `_meta["purelab/display"]` 显示载荷；设置后 tools/call 结果携带。
+        display: Arc<Mutex<Option<Value>>>,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
     }
@@ -453,6 +477,8 @@ mod task13 {
             let requests_for_thread = Arc::clone(&requests);
             let call_count = Arc::new(AtomicUsize::new(0));
             let call_count_for_thread = Arc::clone(&call_count);
+            let display = Arc::new(Mutex::new(None));
+            let display_for_thread = Arc::clone(&display);
             let stop = Arc::new(AtomicBool::new(false));
             let stop_for_thread = Arc::clone(&stop);
             let thread = thread::spawn(move || {
@@ -507,11 +533,20 @@ mod task13 {
                                         if block_calls {
                                             wait_for_client_disconnect(&stream, &stop_for_thread);
                                         } else {
+                                            let mut result = json!({"content": [{"type": "text", "text": "mcp ok"}], "isError": false});
+                                            if let Some(display) = display_for_thread
+                                                .lock()
+                                                .expect("display 锁必须可用")
+                                                .clone()
+                                            {
+                                                result["_meta"] =
+                                                    json!({"purelab/display": display});
+                                            }
                                             write_mcp_json(
                                                 &mut stream,
                                                 json_rpc_result(
                                                     body.get("id").cloned().unwrap_or(Value::Null),
-                                                    json!({"content": [{"type": "text", "text": "mcp ok"}], "isError": false}),
+                                                    result,
                                                 ),
                                                 true,
                                             );
@@ -533,6 +568,7 @@ mod task13 {
                 address,
                 requests,
                 call_count,
+                display,
                 stop,
                 thread: Some(thread),
             }
@@ -541,6 +577,11 @@ mod task13 {
         /// 返回当前 MCP fixture 的 loopback URL。
         fn url(&self) -> String {
             format!("http://{}/mcp", self.address)
+        }
+
+        /// 配置 tools/call 结果携带的 `_meta["purelab/display"]` 显示载荷。
+        fn set_display(&self, display: Value) {
+            *self.display.lock().expect("display 锁必须可用") = Some(display);
         }
 
         /// 等待真实 sidecar 发出 MCP tools/call。
@@ -775,6 +816,7 @@ mod task13 {
             ScriptedResponse::Text(text)
             | ScriptedResponse::TextWithGate { text, .. }
             | ScriptedResponse::TextAndToolCall { text, .. }
+            | ScriptedResponse::TextWithUsage { text, .. }
             | ScriptedResponse::Blocked(text) => {
                 let encoded = serde_json::to_string(text).expect("测试 SSE 文本必须可序列化");
                 format!("data: {{\"choices\":[{{\"delta\":{{\"content\":{encoded}}}}}]}}\n\n")
@@ -868,6 +910,20 @@ mod task13 {
                 {
                     return;
                 }
+            }
+            ScriptedResponse::TextWithUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                ..
+            } => {
+                let usage_frame = format!(
+                    "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{total_tokens}}}}}\n\n"
+                );
+                let _ = stream
+                    .write_all(usage_frame.as_bytes())
+                    .and_then(|_| stream.write_all(b"data: [DONE]\n\n"))
+                    .and_then(|_| stream.flush());
             }
         }
     }
@@ -1683,6 +1739,281 @@ mod task13 {
         );
         assert_jsonrpc_lines(&client.raw_lines);
         process.finish_raw(&mut client, "MCP model call");
+    }
+
+    /// `_meta["purelab/display"]` 必须进入完成态 tool_call_update 的 rawOutput
+    /// 与 journal，但绝不进入模型续写输入。
+    #[test]
+    fn mcp_display_payload_projects_to_tool_update_and_journal_not_model() {
+        let mcp = ScriptedMcp::new(["search"], false);
+        mcp.set_display(json!({
+            "v": 1,
+            "type": "tag_card",
+            "title": "Ambient Pad Display Secret"
+        }));
+        let model = ScriptedL3b::new([
+            ScriptedResponse::tool_call("approved__search", r#"{"query":"q"}"#),
+            ScriptedResponse::text("display done"),
+        ]);
+        let fixture = Fixture::with_model_url_expected_tools_and_mcp(
+            model.base_url().to_owned(),
+            ["approved__search".to_owned()],
+            approved_http_mcp("approved", mcp.url()),
+        );
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "call MCP with display" }]),
+                Some(json!({ "promptId": "prompt-mcp-display" })),
+            ),
+        );
+        let permission = loop {
+            let message = client.read_message();
+            if message["method"] == "session/request_permission"
+                || message["method"] == "_x.ai/session/request_permission"
+            {
+                break message;
+            }
+        };
+        client.send_response(
+            permission["id"].as_u64().expect("permission id 必须存在"),
+            json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+        );
+        mcp.wait_for_call();
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+
+        // 完成态 tool_call_update 的 rawOutput.display 必须包含已校验载荷。
+        let display_updates = client
+            .raw_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| {
+                value["method"] == "session/update"
+                    && value["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                    && value["params"]["update"]["status"] == "completed"
+                    && value["params"]["update"]["rawOutput"]["display"].is_object()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            display_updates.len(),
+            1,
+            "完成态更新必须携带一次 display 载荷: {:?}",
+            client.raw_lines
+        );
+        assert_eq!(
+            display_updates[0]["params"]["update"]["rawOutput"]["display"]["type"],
+            json!("tag_card")
+        );
+
+        // journal 的 Tool 记录必须保留 display 文本供 replay 还原。
+        let records_path = fixture
+            .home
+            .join("efflab-sessions")
+            .join("v1")
+            .join(&session)
+            .join("records.jsonl");
+        let records = fs::read_to_string(records_path).expect("display prompt journal 必须存在");
+        let completed_tool = records
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("journal 行必须可解析"))
+            .find(|record| record["kind"] == "tool" && record["status"] == "completed")
+            .expect("journal 必须有 completed tool 记录");
+        // journal 中 display 以序列化 JSON 文本存储，保持 record 的 Eq 语义。
+        let display_text = completed_tool["display"]
+            .as_str()
+            .expect("journal display 必须是字符串文本");
+        assert_eq!(
+            serde_json::from_str::<Value>(display_text).expect("display 文本必须可解析"),
+            json!({"v": 1, "type": "tag_card", "title": "Ambient Pad Display Secret"})
+        );
+
+        // 模型续写输入不得包含 display 载荷或 _meta key。
+        model.wait_for_requests(2);
+        let second_request = model
+            .request_bodies()
+            .into_iter()
+            .nth(1)
+            .expect("模型必须收到 tool result 续写请求");
+        let encoded = serde_json::to_string(&second_request).expect("请求必须可序列化");
+        assert!(
+            !encoded.contains("purelab/display"),
+            "display 不得进入模型输入: {encoded}"
+        );
+        assert!(
+            !encoded.contains("Ambient Pad Display Secret"),
+            "display 正文不得进入模型输入: {encoded}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+        process.finish_raw(&mut client, "MCP display payload");
+    }
+
+    /// usage 尾帧必须经 `_x.ai/turn_usage` 内部通知上报；不产生 session/update
+    /// 产品事件，journal 也不含 usage。
+    #[test]
+    fn model_usage_tail_reports_turn_usage_notification_only() {
+        let model = ScriptedL3b::new([ScriptedResponse::text_with_usage(
+            "usage answer",
+            291,
+            32,
+            323,
+        )]);
+        let fixture = Fixture::with_model_url(model.base_url().to_owned());
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "usage please" }]),
+                Some(json!({ "promptId": "prompt-usage" })),
+            ),
+        );
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+
+        let values = client
+            .raw_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        let usage_notifications = values
+            .iter()
+            .filter(|value| value["method"] == "_x.ai/turn_usage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            usage_notifications.len(),
+            1,
+            "usage 尾帧必须产生一次内部通知: {values:?}"
+        );
+        assert_eq!(
+            usage_notifications[0]["params"]["usage"],
+            json!({"promptTokens": 291, "completionTokens": 32, "totalTokens": 323})
+        );
+        assert_eq!(
+            usage_notifications[0]["params"]["sessionId"],
+            json!(session)
+        );
+        assert_eq!(
+            usage_notifications[0]["params"]["promptId"],
+            json!("prompt-usage")
+        );
+        // usage 不得混入 session/update 产品事件流。
+        assert!(
+            values.iter().all(|value| {
+                value["method"] != "session/update"
+                    || value["params"]["update"]["sessionUpdate"] != "usage_update"
+            }),
+            "usage 不得出现在 session/update 流: {values:?}"
+        );
+
+        // journal 不得记录 usage 数据。
+        let records_path = fixture
+            .home
+            .join("efflab-sessions")
+            .join("v1")
+            .join(&session)
+            .join("records.jsonl");
+        let records = fs::read_to_string(records_path).expect("usage prompt journal 必须存在");
+        assert!(
+            !records.contains("totalTokens") && !records.contains("total_tokens"),
+            "journal 不得含 usage 字段: {records}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+        process.finish_raw(&mut client, "usage tail notification");
+    }
+
+    /// session/load 回放必须从 journal 还原 display 到 ToolCallUpdate.raw_output，
+    /// 并带统一 replay metadata。
+    #[test]
+    fn session_load_replay_restores_display_in_tool_update() {
+        let mcp = ScriptedMcp::new(["search"], false);
+        mcp.set_display(json!({"v": 1, "type": "tag_card", "title": "Replay Card"}));
+        let model = ScriptedL3b::new([
+            ScriptedResponse::tool_call("approved__search", "{}"),
+            ScriptedResponse::text("done"),
+        ]);
+        let fixture = Fixture::with_model_url_expected_tools_and_mcp(
+            model.base_url().to_owned(),
+            ["approved__search".to_owned()],
+            approved_http_mcp("approved", mcp.url()),
+        );
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "display then replay" }]),
+                Some(json!({ "promptId": "prompt-display-replay" })),
+            ),
+        );
+        let permission = loop {
+            let message = client.read_message();
+            if message["method"] == "session/request_permission"
+                || message["method"] == "_x.ai/session/request_permission"
+            {
+                break message;
+            }
+        };
+        client.send_response(
+            permission["id"].as_u64().expect("permission id 必须存在"),
+            json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+        );
+        mcp.wait_for_call();
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+
+        let load_id = client.send_request(
+            "session/load",
+            json!({
+                "sessionId": session,
+                "cwd": fixture.session_cwd,
+                "mcpServers": []
+            }),
+        );
+        let load_response = client.read_response(load_id);
+        assert!(load_response["result"].is_object());
+
+        // 回放帧必须还原 display，且带 replay 标记。
+        let replay_tool_updates = client
+            .raw_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| {
+                value["method"] == "session/update"
+                    && value["params"]["_meta"]["isReplay"] == json!(true)
+                    && value["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                    && value["params"]["update"]["status"] == "completed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replay_tool_updates.len(),
+            1,
+            "replay 必须回放一条 completed tool 更新: {:?}",
+            client.raw_lines
+        );
+        assert_eq!(
+            replay_tool_updates[0]["params"]["update"]["rawOutput"]["display"],
+            json!({"v": 1, "type": "tag_card", "title": "Replay Card"})
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+        process.finish_raw(&mut client, "display replay restore");
     }
 
     /// permission reject 必须阻止 MCP HTTP call，而不是仅在模型层过滤工具。

@@ -574,6 +574,7 @@ async fn persisted_record_schema_is_closed_and_contains_no_sensitive_fields() {
             name: "safe_tool".to_owned(),
             detail: "safe summary".to_owned(),
             status: "completed".to_owned(),
+            display: None,
         },
         SessionRecord::TurnTerminal {
             sequence: 3,
