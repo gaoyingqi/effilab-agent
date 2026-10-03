@@ -24,7 +24,9 @@ use crate::observability;
 use crate::session_store::{Session, SessionError, SessionRecord, SessionRepository};
 #[cfg(debug_assertions)]
 use crate::test_seam::TestSeam;
-use crate::turn_loop::{TurnControl, TurnLoop, TurnLoopError, is_safe_transcript_tool_name};
+use crate::turn_loop::{
+    TurnControl, TurnLoop, TurnLoopError, emit_context_usage_estimate, is_safe_transcript_tool_name,
+};
 
 /// 当前唯一允许由 ACP wire 调用的扩展逻辑名称；wire 层会带一个前导下划线。
 const MCP_LIST_METHOD: &str = "x.ai/mcp/list";
@@ -92,6 +94,8 @@ struct RuntimeState {
     active_changed: Rc<Notify>,
     /// 已解析的系统提示词；空 Host 配置在构造时已回退到内置最小文本。
     system_prompt: String,
+    /// 已由 runtime config 校验的上下文压缩设置；兼容构造器使用 V1 默认。
+    compact: crate::compact::CompactSettings,
     /// debug 构建中用于控制异步窗口并记录执行点的测试 seam。
     #[cfg(debug_assertions)]
     test_seam: Option<TestSeam>,
@@ -106,6 +110,7 @@ struct RuntimeDependencies {
     expected_tools: BTreeSet<String>,
     ready_tools: BTreeSet<String>,
     system_prompt: String,
+    compact: crate::compact::CompactSettings,
 }
 
 /// 在 ACP current-thread LocalSet 中运行的最小 Agent。
@@ -143,6 +148,7 @@ impl MinimalAgent {
                 shutting_down: false,
                 active_changed: Rc::new(Notify::new()),
                 system_prompt: crate::MINIMAL_SYSTEM_PROMPT.to_owned(),
+                compact: crate::compact::CompactSettings::v1_defaults(),
                 #[cfg(debug_assertions)]
                 test_seam: None,
             })),
@@ -163,10 +169,13 @@ impl MinimalAgent {
             expected_tools,
             McpRuntime::empty(),
             String::new(),
+            crate::compact::CompactSettings::v1_defaults(),
         )
     }
 
     /// 创建生产 runtime Agent，并共享同一个可取消 MCP runtime 到每个 prompt loop。
+    ///
+    /// `compact` 必须来自已校验的版本化 runtime 配置；调用方不得伪造边界外取值。
     pub fn with_runtime_and_mcp(
         expected_cwd: PathBuf,
         repository: SessionRepository,
@@ -174,6 +183,7 @@ impl MinimalAgent {
         expected_tools: BTreeSet<String>,
         mcp: McpRuntime,
         system_prompt: String,
+        compact: crate::compact::CompactSettings,
     ) -> Self {
         // runtime config 的 expected_tools 只描述 Host 批准的 MCP；内置 noop 是固定批准成员。
         let mut approved_tools = expected_tools;
@@ -203,6 +213,7 @@ impl MinimalAgent {
                 shutting_down: false,
                 active_changed: Rc::new(Notify::new()),
                 system_prompt: crate::resolve_system_prompt(&system_prompt).to_owned(),
+                compact,
                 #[cfg(debug_assertions)]
                 test_seam: None,
             })),
@@ -399,6 +410,7 @@ impl MinimalAgent {
             expected_tools: state.expected_tools.clone(),
             ready_tools: state.ready_tools.clone(),
             system_prompt: state.system_prompt.clone(),
+            compact: state.compact,
         })
     }
 
@@ -882,6 +894,29 @@ impl acp::Agent for MinimalAgent {
                 self.replay_session(&session, gateway).await?;
             }
             self.remember_session(&session.id);
+            // 会话激活边界必须重新估算占用，而不是恢复旧快照：replay 只还原
+            // transcript 事件，Host 需要一条新的 live `_x.ai/context_usage`
+            // 反映恢复后的真实占用。估算移出 load 响应路径，detached 任务内
+            // 完成序列化与 fire-and-forget 入队，失败只记日志。
+            if let Some(gateway) = dependencies.gateway.as_ref()
+                && !session.records.is_empty()
+            {
+                let gateway = gateway.clone();
+                let system_prompt = dependencies.system_prompt.clone();
+                let compact = dependencies.compact;
+                // records/id 均 move 进 detached 任务，不为估算额外复制 transcript。
+                let records = session.records;
+                let session_id = session.id;
+                tokio::task::spawn_local(async move {
+                    emit_context_usage_estimate(
+                        &records,
+                        &system_prompt,
+                        compact,
+                        &gateway,
+                        &session_id,
+                    );
+                });
+            }
             observability::session_loaded(true);
         } else {
             let found = self.has_memory_session(&args.session_id);
@@ -1022,6 +1057,7 @@ impl acp::Agent for MinimalAgent {
                         dependencies.expected_tools,
                         dependencies.ready_tools,
                         dependencies.system_prompt,
+                        dependencies.compact,
                     );
                     #[cfg(debug_assertions)]
                     let loop_runner = loop_runner.with_test_seam(self.test_seam());

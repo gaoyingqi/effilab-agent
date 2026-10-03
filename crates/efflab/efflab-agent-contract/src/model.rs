@@ -47,6 +47,130 @@ pub struct RuntimeConfigV1 {
     pub system_prompt: String,
 }
 
+/// RuntimeConfigV2 的默认模型上下文窗口（token）；与 V1 隐含的固定 200k 一致。
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+/// RuntimeConfigV2 的默认压缩触发百分比；与 V1 隐含的固定 70% 一致。
+pub const DEFAULT_COMPACT_THRESHOLD_PERCENT: u64 = 70;
+
+/// RuntimeConfigV2 使用的 `schema_version` 值；版本判别只依赖该字段与文件命名约定。
+pub const RUNTIME_SCHEMA_VERSION_V2: u32 = 2;
+
+fn default_context_window_tokens() -> u64 {
+    DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+fn default_compact_threshold_percent() -> u64 {
+    DEFAULT_COMPACT_THRESHOLD_PERCENT
+}
+
+/// M5 扩展的 sidecar 启动配置；字段和嵌套表均为闭集，新增字段有显式默认值。
+///
+/// 相对 V1 只新增 `context_window_tokens`/`compact_threshold_percent` 两个已校验字段；
+/// 其余字段语义与 V1 完全一致，上下界校验在 contract loader 中 fail-closed 完成。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfigV2 {
+    /// 配置 schema 主版本，必须等于 [`RUNTIME_SCHEMA_VERSION_V2`]。
+    pub schema_version: u32,
+    /// 不包含自身字段的规范化配置摘要。
+    pub runtime_revision: String,
+    /// 会话存储格式版本。
+    pub session_store_version: u32,
+    /// Host 已规范化的绝对 UTF-8 会话工作目录。
+    pub session_cwd: String,
+    /// sidecar 使用的 Host L3b 回环模型。
+    pub model: LoopbackModelSpec,
+    /// Host 审核后的 MCP server 集合；仅使用 runtime-only wire。
+    #[serde(with = "runtime_approved_mcp")]
+    pub approved_mcp: ApprovedMcpConfig,
+    /// sidecar 可期待的、按字典序稳定化的工具名集合。
+    pub expected_tools: BTreeSet<String>,
+    /// Host 注入的产品系统提示词；缺省或空字符串表示 sidecar 使用内置最小提示词。
+    #[serde(default)]
+    pub system_prompt: String,
+    /// 已验证的模型上下文窗口估算（token）；缺省为 200k，必须为非零有界正整数。
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u64,
+    /// 已验证的压缩触发百分比；缺省为 70，取值必须落在 `(0, 100]`。
+    #[serde(default = "default_compact_threshold_percent")]
+    pub compact_threshold_percent: u64,
+}
+
+/// sidecar 启动配置的版本化装载结果；dispatch 依据文件名后按各自 loader 校验。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeConfig {
+    /// Host 历史写出的 V1 配置；读取路径与校验行为保持不变。
+    V1(RuntimeConfigV1),
+    /// M5 之后的 V2 配置；压缩参数由已验证字段驱动。
+    V2(RuntimeConfigV2),
+}
+
+impl RuntimeConfig {
+    /// 统一访问版本化配置的 `schema_version` 字段。
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::V1(config) => config.schema_version,
+            Self::V2(config) => config.schema_version,
+        }
+    }
+
+    /// 统一访问 Host 规范化的绝对 UTF-8 会话工作目录。
+    pub fn session_cwd(&self) -> &str {
+        match self {
+            Self::V1(config) => config.session_cwd.as_str(),
+            Self::V2(config) => config.session_cwd.as_str(),
+        }
+    }
+
+    /// 统一访问 Host L3b 回环模型描述。
+    pub fn model(&self) -> &LoopbackModelSpec {
+        match self {
+            Self::V1(config) => &config.model,
+            Self::V2(config) => &config.model,
+        }
+    }
+
+    /// 统一访问 Host 审核后的 MCP server 集合。
+    pub fn approved_mcp(&self) -> &ApprovedMcpConfig {
+        match self {
+            Self::V1(config) => &config.approved_mcp,
+            Self::V2(config) => &config.approved_mcp,
+        }
+    }
+
+    /// 统一访问 Host 期待的工具名集合。
+    pub fn expected_tools(&self) -> &BTreeSet<String> {
+        match self {
+            Self::V1(config) => &config.expected_tools,
+            Self::V2(config) => &config.expected_tools,
+        }
+    }
+
+    /// 统一访问 Host 注入的系统提示词原文。
+    pub fn system_prompt(&self) -> &str {
+        match self {
+            Self::V1(config) => config.system_prompt.as_str(),
+            Self::V2(config) => config.system_prompt.as_str(),
+        }
+    }
+
+    /// 统一访问已验证的上下文窗口估算；V1 回退到原编译期 200k 默认。
+    pub fn context_window_tokens(&self) -> u64 {
+        match self {
+            Self::V1(_) => DEFAULT_CONTEXT_WINDOW_TOKENS,
+            Self::V2(config) => config.context_window_tokens,
+        }
+    }
+
+    /// 统一访问已验证的压缩触发百分比；V1 回退到原编译期 70% 默认。
+    pub fn compact_threshold_percent(&self) -> u64 {
+        match self {
+            Self::V1(_) => DEFAULT_COMPACT_THRESHOLD_PERCENT,
+            Self::V2(config) => config.compact_threshold_percent,
+        }
+    }
+}
+
 /// 只允许连接 Host L3b 的回环模型描述；不承载用户密钥。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

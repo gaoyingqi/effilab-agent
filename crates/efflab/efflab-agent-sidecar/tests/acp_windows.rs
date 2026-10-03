@@ -99,17 +99,17 @@ impl ModelServer {
     fn wait_for_request(&self) {
         let deadline = Instant::now() + EXIT_TIMEOUT;
         while self.request_count.load(Ordering::Acquire) == 0 {
-            assert!(Instant::now() < deadline, "Windows sidecar 未请求 loopback 模型");
+            assert!(
+                Instant::now() < deadline,
+                "Windows sidecar 未请求 loopback 模型"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
 
     /// 返回模型端点收到的授权头，确认 sidecar 使用的是 binding token。
     fn authorization_values(&self) -> Vec<String> {
-        self.authorization
-            .lock()
-            .expect("读取模型授权头")
-            .clone()
+        self.authorization.lock().expect("读取模型授权头").clone()
     }
 }
 
@@ -357,12 +357,16 @@ fn initialize_params() -> serde_json::Value {
 fn assert_jsonrpc_lines(lines: &[String]) {
     assert!(!lines.is_empty(), "Windows ACP 回合必须产生 JSON-RPC 输出");
     for (index, line) in lines.iter().enumerate() {
-        let value: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|error| panic!("Windows sidecar stdout 第 {index} 行不是 JSON: {error}"));
+        let value: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("Windows sidecar stdout 第 {index} 行不是 JSON: {error}")
+        });
         assert_eq!(value["jsonrpc"], "2.0");
         assert!(
             value.get("id").is_some()
-                || value.get("method").and_then(serde_json::Value::as_str).is_some(),
+                || value
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
             "Windows sidecar stdout 第 {index} 行缺少 JSON-RPC id 或 method"
         );
     }
@@ -456,12 +460,7 @@ fn windows_sidecar_stderr_excludes_prompt_endpoint_and_model_payloads() {
     model.wait_for_request();
 
     let stderr = process.finish(&mut client);
-    for forbidden in [
-        prompt_secret,
-        response_secret,
-        L3B_BIND,
-        &model.endpoint(),
-    ] {
+    for forbidden in [prompt_secret, response_secret, L3B_BIND, &model.endpoint()] {
         assert!(
             !stderr.contains(forbidden),
             "sidecar stderr 不得包含敏感或正文内容 {forbidden:?}: {stderr:?}"

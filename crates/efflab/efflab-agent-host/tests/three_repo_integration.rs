@@ -578,8 +578,8 @@ impl Harness {
         let path = self
             ._temporary
             .path()
-            .join("app-data/task24-three-repo/scope-a/home/runtime-config.v1.toml");
-        fs::read_to_string(path).expect("Host 必须生成 v1 runtime config")
+            .join("app-data/task24-three-repo/scope-a/home/runtime-config.v2.toml");
+        fs::read_to_string(path).expect("Host 必须生成 v2 runtime config")
     }
 
     /// 返回当前事件快照的独立副本，避免在条件等待外持有锁。
@@ -963,15 +963,15 @@ done
 [ "$home_count" -eq 1 ] || exit 22
 [ "$session_cwd_count" -eq 1 ] || exit 23
 [ "$stdio_count" -eq 1 ] || exit 24
-# 启动前验证 Host 的 v1 配置和短生命周期 binding，绝不读取或落盘用户 Key。
+# 启动前验证 Host 的 v2 配置和短生命周期 binding，绝不读取或落盘用户 Key。
 test "$home" = "$expected_home" || exit 25
 test "$session_cwd" = "$expected_session_cwd" || exit 26
-test "$runtime_config" = "$expected_home/runtime-config.v1.toml" || exit 27
+test "$runtime_config" = "$expected_home/runtime-config.v2.toml" || exit 27
 test -n "${EFFLAB_L3B_BIND:-}" || exit 41
 test -n "$home" || exit 42
 test -n "$runtime_config" || exit 43
 test -f "$runtime_config" || exit 44
-/usr/bin/grep -q '^schema_version = 1$' "$runtime_config" || exit 46
+/usr/bin/grep -q '^schema_version = 2$' "$runtime_config" || exit 46
 /usr/bin/grep -q '^backend = "chat_completions"$' "$runtime_config" || exit 47
 /usr/bin/grep -q '^token_env = "EFFLAB_L3B_BIND"$' "$runtime_config" || exit 48
 /usr/bin/grep -q '^session_cwd = ' "$runtime_config" || exit 49

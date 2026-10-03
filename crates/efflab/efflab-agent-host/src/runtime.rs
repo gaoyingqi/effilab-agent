@@ -70,12 +70,20 @@ const TURN_FAILED_USER_MESSAGE: &str = "Reply did not complete; please retry";
 /// sidecar usage 内部上报的逻辑方法名（wire 上是 `_x.ai/turn_usage`）；
 /// 该通知在投影前内部化，不进 Kit 事件、journal 或 analytics。
 const TURN_USAGE_METHOD: &str = "x.ai/turn_usage";
+/// sidecar 会话级上下文占用估算的逻辑方法名（wire 上是 `_x.ai/context_usage`）；
+/// 与 `x.ai/turn_usage` 不同，它会被投影为 live-only 的 `KitBlock::ContextUsage`，
+/// 只发当前快照、不进入可恢复 transcript。
+const CONTEXT_USAGE_METHOD: &str = "x.ai/context_usage";
+/// `KitBlock::ContextUsage` 在同一会话内的固定合并键；sequence 仍单调递增。
+const CONTEXT_USAGE_BLOCK_ID: &str = "context_usage";
 
 /// 把 sidecar 稳定错误码转成用户可读提示，不暴露内部实现名词。
 fn turn_failure_user_message(code: &str) -> &'static str {
     match code {
         "turn_model_error" => "The model did not return a valid reply; please retry",
-        "turn_session_not_found" | "turn_session_read_only" => "The current session cannot continue; please start a new conversation",
+        "turn_session_not_found" | "turn_session_read_only" => {
+            "The current session cannot continue; please start a new conversation"
+        }
         "turn_session_error" => "Failed to save the session; please retry",
         "turn_transport_error" => "Connection interrupted; please retry",
         "turn_tool_rejected" => "This tool call was not allowed",
@@ -323,7 +331,9 @@ impl HostRuntime {
                 supervisor_capability,
                 SupervisorCapability::Unavailable { .. }
             ) {
-                return Err(sidecar_unavailable("The current platform does not support hardened sidecars"));
+                return Err(sidecar_unavailable(
+                    "The current platform does not support hardened sidecars",
+                ));
             }
             return Err(LlmChannelError::Unconfigured.as_kit_error());
         }
@@ -377,7 +387,9 @@ impl HostRuntime {
         let decision = self
             .submissions
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Submission map is unavailable"))?
+            .map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "Submission map is unavailable")
+            })?
             // 指纹只依赖提交 wire 的原始 text 与排序后的 mention id，不能依赖可变展示文本。
             .record(&scope_id, &session_id, &submission_id, &text, &mentions);
 
@@ -463,10 +475,9 @@ impl HostRuntime {
 
     /// 实施全局 Channel 事务：先提交/失效，再 drain 与重建全部先前存活 scope。
     fn dispatch_set_channel(&self, request: SetLlmChannelRequest) -> Result<KitReply, KitError> {
-        let _transition = self
-            .channel_transition
-            .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Channel transaction is unavailable"))?;
+        let _transition = self.channel_transition.lock().map_err(|_| {
+            KitError::non_retryable("sidecar_unavailable", "Channel transaction is unavailable")
+        })?;
         // 先尝试交付此前 actor 退出后保留的终态，再决定是否允许本次换代继续。
         self.retry_terminal_outbox()?;
         let service = self.channel_service()?;
@@ -491,12 +502,17 @@ impl HostRuntime {
         let mut scopes = self
             .restart_retry_scopes
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable"))?
+            .map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable")
+            })?
             .clone();
         // 只复制旧 actor；cleanup 失败时原句柄仍留在 map 作为 tombstone，禁止新代并存。
         let previous = {
             let actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                KitError::non_retryable(
+                    "sidecar_unavailable",
+                    "Scope actor registry is unavailable",
+                )
             })?;
             actors
                 .iter()
@@ -522,7 +538,10 @@ impl HostRuntime {
                 continue;
             }
             let mut actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                KitError::non_retryable(
+                    "sidecar_unavailable",
+                    "Scope actor registry is unavailable",
+                )
             })?;
             if actors
                 .get(&scope_id)
@@ -570,7 +589,9 @@ impl HostRuntime {
         let scopes = self
             .restart_retry_scopes
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable"))?
+            .map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable")
+            })?
             .clone();
         if scopes.is_empty() {
             return Ok(());
@@ -580,7 +601,10 @@ impl HostRuntime {
         for scope_id in scopes {
             let (already_recovered, previous) = {
                 let actors = self.actors.lock().map_err(|_| {
-                    KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                    KitError::non_retryable(
+                        "sidecar_unavailable",
+                        "Scope actor registry is unavailable",
+                    )
                 })?;
                 match actors.get(&scope_id) {
                     Some(actor) if actor.accepting.load(Ordering::Acquire) => (true, None),
@@ -599,7 +623,10 @@ impl HostRuntime {
                     continue;
                 }
                 let mut actors = self.actors.lock().map_err(|_| {
-                    KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                    KitError::non_retryable(
+                        "sidecar_unavailable",
+                        "Scope actor registry is unavailable",
+                    )
                 })?;
                 if actors
                     .get(&scope_id)
@@ -637,16 +664,17 @@ impl HostRuntime {
 
     /// 取得或新建一个 scope actor；本入口与 SetLlmChannel 共享全局换代门。
     fn actor_for_scope(&self, scope_id: &str) -> Result<Arc<ActorHandle>, KitError> {
-        let _transition = self
-            .channel_transition
-            .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Channel transaction is unavailable"))?;
+        let _transition = self.channel_transition.lock().map_err(|_| {
+            KitError::non_retryable("sidecar_unavailable", "Channel transaction is unavailable")
+        })?;
         // 新命令触发旧 actor cleanup 时，先重试跨线程保留的 terminal event。
         self.retry_terminal_outbox()?;
         let restart_failed = self
             .restart_retry_scopes
             .lock()
-            .map_err(|_| KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable"))?
+            .map_err(|_| {
+                KitError::non_retryable("sidecar_unavailable", "Restart retry state is unavailable")
+            })?
             .contains(scope_id);
         if restart_failed {
             tracing::debug!(
@@ -657,7 +685,10 @@ impl HostRuntime {
         }
         let previous = {
             let actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                KitError::non_retryable(
+                    "sidecar_unavailable",
+                    "Scope actor registry is unavailable",
+                )
             })?;
             if let Some(actor) = actors.get(scope_id) {
                 if actor.restart_blocked.load(Ordering::Acquire) {
@@ -665,7 +696,9 @@ impl HostRuntime {
                         scope = %scope_id,
                         "scope 因 MCP 安全违例保持 tombstone，拒绝自动复活"
                     );
-                    return Err(sidecar_unavailable("Scope is unavailable due to an MCP safety violation"));
+                    return Err(sidecar_unavailable(
+                        "Scope is unavailable due to an MCP safety violation",
+                    ));
                 }
                 if actor.accepting.load(Ordering::Acquire) {
                     return Ok(Arc::clone(actor));
@@ -679,10 +712,15 @@ impl HostRuntime {
         if let Some(actor) = previous {
             let cleanup = actor.shutdown();
             if !cleanup.is_success() {
-                return Err(sidecar_unavailable("Previous scope cleanup did not complete"));
+                return Err(sidecar_unavailable(
+                    "Previous scope cleanup did not complete",
+                ));
             }
             let mut actors = self.actors.lock().map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                KitError::non_retryable(
+                    "sidecar_unavailable",
+                    "Scope actor registry is unavailable",
+                )
             })?;
             if actors
                 .get(scope_id)
@@ -696,7 +734,10 @@ impl HostRuntime {
         self.actors
             .lock()
             .map_err(|_| {
-                KitError::non_retryable("sidecar_unavailable", "Scope actor registry is unavailable")
+                KitError::non_retryable(
+                    "sidecar_unavailable",
+                    "Scope actor registry is unavailable",
+                )
             })?
             .insert(scope_id.to_string(), Arc::clone(&actor));
         Ok(actor)
@@ -907,7 +948,9 @@ impl HostRuntime {
             if let Some(actor) = actors.get(&scope_id) {
                 clear_cleanup_failure(&actor.cleanup_result, CleanupFailureKind::TerminalEvent);
                 if !actor.clear_shutdown_failure(CleanupFailureKind::TerminalEvent) {
-                    return Err(sidecar_unavailable("Failed to sync the terminal cleanup result"));
+                    return Err(sidecar_unavailable(
+                        "Failed to sync the terminal cleanup result",
+                    ));
                 }
             }
         }
@@ -1656,6 +1699,8 @@ struct ScopeActor {
     last_activity: Instant,
     /// 已内部化的损坏 usage 通知计数；不属于 Kit 语义，只供日志。
     dropped_usage_reports: u64,
+    /// 已内部化的损坏 context_usage 通知计数；损坏载荷不产出任何 Kit 事件。
+    dropped_context_usage_reports: u64,
     dead: bool,
     /// 显式 shutdown 已完成；run loop 必须在回执后退出而不是继续消费命令。
     exit_requested: bool,
@@ -1731,6 +1776,7 @@ impl ScopeActor {
             terminal_turns: BTreeSet::new(),
             last_activity: Instant::now(),
             dropped_usage_reports: 0,
+            dropped_context_usage_reports: 0,
             dead: false,
             exit_requested: false,
             acp_shutdown_done: false,
@@ -1944,7 +1990,9 @@ impl ScopeActor {
                         event = "sidecar_initialize_rejected",
                         "sidecar initialize result 不符合 ACP 能力、认证或 Efflab metadata 闭集"
                     );
-                    self.enter_dead(sidecar_unavailable("sidecar initialize handshake is not supported"));
+                    self.enter_dead(sidecar_unavailable(
+                        "sidecar initialize handshake is not supported",
+                    ));
                 }
                 Err(_) => {
                     log::error!(
@@ -2013,6 +2061,25 @@ impl ScopeActor {
         // journal 回放流或 analytics 载荷。
         if method == TURN_USAGE_METHOD {
             self.observe_turn_usage(params);
+            return;
+        }
+
+        // context_usage 是会话级 live 快照信号：投影为 KitBlock::ContextUsage 供
+        // 产品面板即时展示，但不写入 transcript，replay 也不重放旧占用。
+        if method == CONTEXT_USAGE_METHOD {
+            if is_replay {
+                // live-only 输入边界：带 replay 标记的占用通知即使属于当前 load
+                // flight 也必须拒绝；旧估算不得冒充新快照。fail-closed 只计数。
+                self.dropped_context_usage_reports =
+                    self.dropped_context_usage_reports.saturating_add(1);
+                tracing::debug!(
+                    scope = %self.scope_id,
+                    dropped_context_usage_reports = self.dropped_context_usage_reports,
+                    "已内部化带 replay 标记的 x.ai/context_usage 通知"
+                );
+                return;
+            }
+            self.observe_context_usage(params);
             return;
         }
 
@@ -2096,6 +2163,70 @@ impl ScopeActor {
         );
     }
 
+    /// 严格解析 `x.ai/context_usage` 并把估算快照投影为会话级 KitProductEvent。
+    ///
+    /// 该事件固定 `turn_id/submission_id = null`、固定 block_id `context_usage`，
+    /// `origin=live` 且 `retain=false`：估算只反映当前会话内存状态，journal replay
+    /// 绝不能把旧占用当成恢复事实。损坏载荷只内部化计数，不影响会话。
+    fn observe_context_usage(&mut self, params: &Value) {
+        let parsed = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .and_then(|session_id| {
+                Some((
+                    session_id.to_string(),
+                    params.get("usedTokensEstimate")?.as_u64()?,
+                    params.get("contextWindowTokens")?.as_u64()?,
+                    params.get("percentEstimate")?.as_u64()?,
+                    params.get("measuredAtMs")?.as_u64()?,
+                ))
+            });
+        let Some((
+            session_id,
+            used_tokens_estimate,
+            context_window_tokens,
+            percent_estimate,
+            measured_at_ms,
+        )) = parsed
+        else {
+            self.dropped_context_usage_reports =
+                self.dropped_context_usage_reports.saturating_add(1);
+            tracing::debug!(
+                scope = %self.scope_id,
+                dropped_context_usage_reports = self.dropped_context_usage_reports,
+                "已内部化无法解析的 x.ai/context_usage 通知"
+            );
+            return;
+        };
+
+        let Ok(sequence) = self.projector.next_host_sequence(&session_id) else {
+            return;
+        };
+        // session 级事件沿用 Host 合成 event_id 形状；block_id 固定便于消费方合并快照。
+        let event_id = format!("{session_id}:host:{CONTEXT_USAGE_BLOCK_ID}:{sequence}");
+        self.emit_event(
+            KitProductEvent {
+                schema_version: KIT_SCHEMA_VERSION,
+                scope_id: self.scope_id.clone(),
+                session_id,
+                turn_id: None,
+                submission_id: None,
+                event_id,
+                sequence,
+                origin: Origin::Live,
+                block_id: CONTEXT_USAGE_BLOCK_ID.to_string(),
+                block: KitBlock::ContextUsage {
+                    used_tokens_estimate,
+                    context_window_tokens,
+                    percent_estimate,
+                    measured_at_ms,
+                },
+            },
+            false,
+        );
+    }
+
     /// 处理 M1 必须回复的 reverse RPC，权限选择只使用本次 options 中的精确 id。
     fn handle_reverse_request(&mut self, id: RequestId, method: &str, params: &Value) {
         if is_permission_request(method) {
@@ -2129,7 +2260,9 @@ impl ScopeActor {
                 .reply_validated(id, ValidatedReply::Result(result), &self.policy)
                 .is_err()
             {
-                self.enter_dead(sidecar_unavailable("Failed to reply to the sidecar permission request"));
+                self.enter_dead(sidecar_unavailable(
+                    "Failed to reply to the sidecar permission request",
+                ));
             }
             return;
         }
@@ -2155,7 +2288,9 @@ impl ScopeActor {
                     session = %session_id,
                     "Failed to reply to the unsupported sidecar reverse request"
                 );
-                self.enter_dead(sidecar_unavailable("Failed to reply to the unsupported sidecar reverse request"));
+                self.enter_dead(sidecar_unavailable(
+                    "Failed to reply to the unsupported sidecar reverse request",
+                ));
                 return;
             }
             tracing::debug!(
@@ -2178,7 +2313,9 @@ impl ScopeActor {
             )
             .is_err()
         {
-            self.enter_dead(sidecar_unavailable("Failed to reply to the unknown sidecar request"));
+            self.enter_dead(sidecar_unavailable(
+                "Failed to reply to the unknown sidecar request",
+            ));
         }
     }
 
@@ -2504,7 +2641,9 @@ impl ScopeActor {
                     session = %session_id,
                     "session/prompt 写入结局无法确认"
                 );
-                let _ = reply.send(Err(sidecar_unavailable("Failed to confirm whether session/prompt was written")));
+                let _ = reply.send(Err(sidecar_unavailable(
+                    "Failed to confirm whether session/prompt was written",
+                )));
                 self.enter_dead(sidecar_unavailable("sidecar stdin is unavailable"));
             }
         }
@@ -2560,7 +2699,12 @@ impl ScopeActor {
                     });
                 if let Some(submission_id) = cancelled_submission {
                     self.cancel_requested.insert(session_id.clone());
-                    self.emit_turn_status(&session_id, &submission_id, "cancelled", "Turn cancelled");
+                    self.emit_turn_status(
+                        &session_id,
+                        &submission_id,
+                        "cancelled",
+                        "Turn cancelled",
+                    );
                 } else if !self.in_flight.contains_key(&session_id) {
                     // 无 active turn 的 Cancel 仍保留一次性 pre-cancel 合同；BTreeSet 去重 marker。
                     self.cancel_requested.insert(session_id.clone());
@@ -2637,7 +2781,9 @@ impl ScopeActor {
             Err(_) => None,
         };
         let Some(session_id) = session_id else {
-            let _ = reply.send(Err(sidecar_unavailable("sidecar did not return a valid sessionId")));
+            let _ = reply.send(Err(sidecar_unavailable(
+                "sidecar did not return a valid sessionId",
+            )));
             return;
         };
         self.active_sessions.insert(session_id.clone());
@@ -2718,7 +2864,9 @@ impl ScopeActor {
                 )));
             }
             Err(_) => {
-                let _ = reply.send(Err(sidecar_unavailable("Failed to delete the sidecar session")));
+                let _ = reply.send(Err(sidecar_unavailable(
+                    "Failed to delete the sidecar session",
+                )));
             }
         }
     }
@@ -2787,7 +2935,9 @@ impl ScopeActor {
         ) && should_retire_after_load(outcome)
         {
             // 失败 load 的 transport 不再承载同 session 新 flight，隔离没有 generation 的旧 replay。
-            self.enter_dead(sidecar_unavailable("sidecar load failed; transport retired"));
+            self.enter_dead(sidecar_unavailable(
+                "sidecar load failed; transport retired",
+            ));
         }
     }
 
@@ -2926,7 +3076,9 @@ impl ScopeActor {
         let replay_epoch = flight.replay_epoch;
         let generation = flight.generation;
         if self.acp.revoke_outbound_request(request_id).is_err() {
-            self.enter_dead(sidecar_unavailable("Failed to cancel the timed-out session/load request"));
+            self.enter_dead(sidecar_unavailable(
+                "Failed to cancel the timed-out session/load request",
+            ));
             return;
         }
         if self.finish_load_flight(
@@ -2937,7 +3089,9 @@ impl ScopeActor {
             LoadOutcome::Timeout,
         ) {
             // deadline 到期后退休整个 actor，避免没有 generation 的旧 replay 进入新 flight。
-            self.enter_dead(sidecar_unavailable("session/load timed out; transport retired"));
+            self.enter_dead(sidecar_unavailable(
+                "session/load timed out; transport retired",
+            ));
         }
     }
 
@@ -2957,9 +3111,12 @@ impl ScopeActor {
             return;
         }
         match result {
-            Ok(_) => {
-                self.emit_turn_status(&session_id, &submission_id, "turn_completed", "Turn completed")
-            }
+            Ok(_) => self.emit_turn_status(
+                &session_id,
+                &submission_id,
+                "turn_completed",
+                "Turn completed",
+            ),
             Err(error) => self.emit_turn_status(
                 &session_id,
                 &submission_id,
@@ -3043,7 +3200,9 @@ impl ScopeActor {
             Err(_) => {
                 // catalog 的 JSON-RPC error 可以降级，但连查询都写不进 stdin 时 sidecar
                 // 已不可信，不能绕过 gate 继续写 prompt。
-                self.enter_dead(sidecar_unavailable("Failed to write the MCP catalog request"));
+                self.enter_dead(sidecar_unavailable(
+                    "Failed to write the MCP catalog request",
+                ));
             }
         }
     }
@@ -3061,7 +3220,9 @@ impl ScopeActor {
             self.catalog_pending.remove(&session_id);
             if self.acp.revoke_outbound_request(request_id).is_err() {
                 // 无法取得 ACP 账本锁时不能确信后续请求是否会被正确限额，保守停掉 scope。
-                self.enter_dead(sidecar_unavailable("Failed to cancel the timed-out MCP catalog request"));
+                self.enter_dead(sidecar_unavailable(
+                    "Failed to cancel the timed-out MCP catalog request",
+                ));
                 return;
             }
             if matches!(
@@ -3933,7 +4094,9 @@ fn reject_unwritable_session_request(method: &str, error: anyhow::Error, reply: 
     log::error!(
         "Host Agent Kit lifecycle stage=acp_write failed method={method} error_code=sidecar_unavailable reason={reason}"
     );
-    let _ = reply.send(Err(sidecar_unavailable(&format!("Failed to write {method}"))));
+    let _ = reply.send(Err(sidecar_unavailable(&format!(
+        "Failed to write {method}"
+    ))));
 }
 
 /// 只把明确的 ACP NotFound 错误码映射为 session_not_found。
@@ -3949,10 +4112,13 @@ fn is_close_session_not_found(error: &RpcError) -> bool {
 /// 失败 load 必须保持可观察且不泄漏 sidecar 原始错误内容。
 fn load_outcome_error(outcome: LoadOutcome) -> KitError {
     match outcome {
-        LoadOutcome::SessionNotFound => {
-            KitError::non_retryable("session_not_found", "sidecar did not find the specified session")
+        LoadOutcome::SessionNotFound => KitError::non_retryable(
+            "session_not_found",
+            "sidecar did not find the specified session",
+        ),
+        LoadOutcome::LoadError => {
+            sidecar_unavailable("Failed to load the sidecar session; retryable")
         }
-        LoadOutcome::LoadError => sidecar_unavailable("Failed to load the sidecar session; retryable"),
         LoadOutcome::Timeout => sidecar_unavailable("session/load timed out; retryable"),
         LoadOutcome::Cancelled => KitError::non_retryable("cancelled", "Session resume cancelled"),
         LoadOutcome::TransportDeath | LoadOutcome::ScopeDead => {
@@ -4366,7 +4532,10 @@ mod tests {
             turn_failure_user_message("turn_model_error"),
             "The model did not return a valid reply; please retry"
         );
-        assert_eq!(turn_failure_user_message("unknown"), "Reply did not complete; please retry");
+        assert_eq!(
+            turn_failure_user_message("unknown"),
+            "Reply did not complete; please retry"
+        );
         assert!(
             !turn_failure_user_message("turn_model_error").contains("sidecar"),
             "用户提示不得出现 sidecar"
@@ -6285,11 +6454,7 @@ done
                 self.inner.unseal_secret(sealed)
             }
 
-            fn seal_llm_secret(
-                &self,
-                slot: LlmSecretSlot,
-                plain: &[u8],
-            ) -> Result<SealedSecret> {
+            fn seal_llm_secret(&self, slot: LlmSecretSlot, plain: &[u8]) -> Result<SealedSecret> {
                 self.inner.seal_llm_secret(slot, plain)
             }
 
@@ -6311,10 +6476,11 @@ done
                 session_id: &str,
                 usage: &crate::TurnUsage,
             ) {
-                self.seen
-                    .lock()
-                    .expect("usage 记录锁必须可用")
-                    .push((scope_id.to_string(), session_id.to_string(), usage.clone()));
+                self.seen.lock().expect("usage 记录锁必须可用").push((
+                    scope_id.to_string(),
+                    session_id.to_string(),
+                    usage.clone(),
+                ));
             }
         }
 
@@ -6420,6 +6586,291 @@ done
         assert!(
             events.lock().expect("测试事件锁必须可用").is_empty(),
             "损坏的 usage 通知同样不得产生事件"
+        );
+    }
+
+    /// `x.ai/context_usage` 必须投影为会话级 live 快照：固定 block_id、null 回合
+    /// 标识、递增 sequence；损坏载荷只计数；且不进入可恢复 transcript。
+    #[test]
+    fn context_usage_notification_emits_live_only_snapshot() {
+        struct RecordingSink {
+            events: Arc<Mutex<Vec<KitProductEvent>>>,
+        }
+
+        impl KitEventSink for RecordingSink {
+            fn emit(&self, event: KitProductEvent) -> Result<()> {
+                self.events.lock().expect("测试事件锁必须可用").push(event);
+                Ok(())
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("必须能创建 context_usage 测试目录");
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("context_usage 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(RecordingSink {
+                events: Arc::clone(&events),
+            }),
+            receiver,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(CleanupResult::default())),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
+        );
+        actor.initialized = true;
+
+        // 同一 session 两条快照：共享固定 block_id，sequence 单调递增。
+        for (used, percent, at_ms) in [(1_000_u64, 1_u64, 100_u64), (2_000, 2, 200)] {
+            actor.handle_notification(
+                CONTEXT_USAGE_METHOD,
+                &json!({
+                    "sessionId": "session-a",
+                    "usedTokensEstimate": used,
+                    "contextWindowTokens": 200_000,
+                    "percentEstimate": percent,
+                    "measuredAtMs": at_ms
+                }),
+            );
+        }
+        {
+            let emitted = events.lock().expect("测试事件锁必须可用");
+            assert_eq!(emitted.len(), 2, "合法 context_usage 必须各产出一条事件");
+            for (index, emitted_event) in emitted.iter().enumerate() {
+                assert_eq!(emitted_event.scope_id, "scope-a");
+                assert_eq!(emitted_event.session_id, "session-a");
+                assert_eq!(emitted_event.turn_id, None);
+                assert_eq!(emitted_event.submission_id, None);
+                assert_eq!(emitted_event.origin, Origin::Live);
+                assert_eq!(emitted_event.block_id, "context_usage");
+                assert_eq!(emitted_event.sequence, index as u64);
+                let KitBlock::ContextUsage {
+                    used_tokens_estimate,
+                    percent_estimate,
+                    measured_at_ms,
+                    ..
+                } = &emitted_event.block
+                else {
+                    panic!("context_usage 通知必须投影为 ContextUsage block");
+                };
+                assert_eq!(*used_tokens_estimate, 1_000 * (index as u64 + 1));
+                assert_eq!(*percent_estimate, index as u64 + 1);
+                assert_eq!(*measured_at_ms, 100 * (index as u64 + 1));
+            }
+        }
+
+        // 占用快照是 live-only：即使 retain 路径收到也不得写入 transcript，
+        // hot resume 的 replay 因此永远不会重放旧占用。
+        assert!(
+            !actor.transcript.contains_key("session-a")
+                || actor.transcript["session-a"]
+                    .iter()
+                    .all(|event| !matches!(event.block, KitBlock::ContextUsage { .. })),
+            "context_usage 不得进入可恢复 transcript"
+        );
+
+        // 损坏载荷：不产事件，只递增内部计数。
+        actor.handle_notification(
+            CONTEXT_USAGE_METHOD,
+            &json!({
+                "sessionId": "session-a",
+                "usedTokensEstimate": "not-a-number"
+            }),
+        );
+        assert_eq!(actor.dropped_context_usage_reports, 1);
+        assert_eq!(
+            events.lock().expect("测试事件锁必须可用").len(),
+            2,
+            "损坏的 context_usage 通知不得产生事件"
+        );
+    }
+
+    /// 为 replay 负向测试构造最小 ScopeActor；返回 actor 与已 emit 事件列表。
+    fn context_usage_test_actor(
+        temporary: &tempfile::TempDir,
+        events: Arc<Mutex<Vec<KitProductEvent>>>,
+    ) -> ScopeActor {
+        struct RecordingSink {
+            events: Arc<Mutex<Vec<KitProductEvent>>>,
+        }
+
+        impl KitEventSink for RecordingSink {
+            fn emit(&self, event: KitProductEvent) -> Result<()> {
+                self.events.lock().expect("测试事件锁必须可用").push(event);
+                Ok(())
+            }
+        }
+
+        let config = crate::HostRuntimeConfig {
+            home_root: temporary.path().join("app-data"),
+            sidecar_bin: temporary.path().join("unused-sidecar"),
+            sidecar_log_path: temporary.path().join("sidecar.log"),
+            mcp_exec_root: temporary.path().join("mcp"),
+            idle_after: Duration::from_secs(60),
+            l3b: L3bRuntimeConfig::default(),
+            system_prompt: String::new(),
+        };
+        let runtime = HostRuntime::new(LifecycleTestApp, NoopSink, config);
+        let service = runtime
+            .channel_service()
+            .expect("测试 actor 必须取得 Channel service");
+        let (_stdout_peer, stdout) =
+            std::os::unix::net::UnixStream::pair().expect("context_usage 测试必须创建 stdout pipe");
+        let acp = AcpRuntime::new(std::io::sink(), stdout);
+        let (_sender, receiver) = mpsc::channel();
+        let mut actor = ScopeActor::new(
+            "scope-a".to_string(),
+            acp,
+            HostPolicy::new(temporary.path()),
+            service,
+            Arc::new(RecordingSink { events }),
+            receiver,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(CleanupResult::default())),
+            Arc::new(Mutex::new(TerminalOutbox::default())),
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ApprovedMcpSpec::default(),
+            Arc::new(LifecycleTestApp),
+        );
+        actor.initialized = true;
+        actor
+    }
+
+    /// 合法 load flight 内带 `_meta.isReplay=true` 的占用通知仍必须被拒绝：
+    /// replay 只重放 transcript 事件，旧估算不得冒充新 live 快照。
+    #[test]
+    fn context_usage_replay_notification_inside_load_flight_is_dropped() {
+        let temporary = tempfile::tempdir().expect("必须能创建 context_usage 测试目录");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = context_usage_test_actor(&temporary, Arc::clone(&events));
+        actor.load_flight = Some(LoadFlight {
+            session_id: "session-a".to_string(),
+            owner_request_id: RequestId::new(41),
+            replay_epoch: 7,
+            waiters: Vec::new(),
+            accepted_resume: true,
+            pending_send: None,
+            deadline: Instant::now() + Duration::from_secs(60),
+            generation: 3,
+            state: LoadFlightState::AcpWritten,
+        });
+
+        actor.handle_notification(
+            CONTEXT_USAGE_METHOD,
+            &json!({
+                "sessionId": "session-a",
+                "_meta": {"isReplay": true},
+                "usedTokensEstimate": 3_000,
+                "contextWindowTokens": 200_000,
+                "percentEstimate": 2,
+                "measuredAtMs": 300
+            }),
+        );
+
+        assert!(
+            events.lock().expect("测试事件锁必须可用").is_empty(),
+            "flight 内的 replay context_usage 不得产出任何 Kit 事件"
+        );
+        assert_eq!(actor.dropped_context_usage_reports, 1);
+        assert!(
+            !actor.dead,
+            "flight 内的 replay context_usage 不得触发 actor 死亡"
+        );
+
+        // 正向对照：同一 flight 内的 live 快照仍照常投影。
+        actor.handle_notification(
+            CONTEXT_USAGE_METHOD,
+            &json!({
+                "sessionId": "session-a",
+                "usedTokensEstimate": 4_000,
+                "contextWindowTokens": 200_000,
+                "percentEstimate": 3,
+                "measuredAtMs": 400
+            }),
+        );
+        {
+            let emitted = events.lock().expect("测试事件锁必须可用");
+            assert_eq!(emitted.len(), 1, "live context_usage 必须产出一条事件");
+            assert_eq!(emitted[0].origin, Origin::Live);
+            assert!(
+                matches!(emitted[0].block, KitBlock::ContextUsage { .. }),
+                "live context_usage 必须投影为 ContextUsage block"
+            );
+        }
+    }
+
+    /// 过期 flight 场景：deadline 已过期的通知由 flight 过期/死亡边界先处理，
+    /// 仍不得产出 ContextUsage 事件。
+    #[test]
+    fn context_usage_replay_notification_expired_flight_is_dropped() {
+        let temporary = tempfile::tempdir().expect("必须能创建 context_usage 测试目录");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = context_usage_test_actor(&temporary, Arc::clone(&events));
+        actor.load_flight = Some(LoadFlight {
+            session_id: "session-a".to_string(),
+            owner_request_id: RequestId::new(41),
+            replay_epoch: 7,
+            waiters: Vec::new(),
+            accepted_resume: true,
+            pending_send: None,
+            deadline: Instant::now() - Duration::from_secs(1),
+            generation: 3,
+            state: LoadFlightState::AcpWritten,
+        });
+
+        actor.handle_notification(
+            CONTEXT_USAGE_METHOD,
+            &json!({
+                "sessionId": "session-a",
+                "_meta": {"isReplay": true},
+                "usedTokensEstimate": 3_000,
+                "contextWindowTokens": 200_000,
+                "percentEstimate": 2,
+                "measuredAtMs": 300
+            }),
+        );
+
+        let emitted = events.lock().expect("测试事件锁必须可用");
+        assert!(
+            emitted
+                .iter()
+                .all(|event| !matches!(event.block, KitBlock::ContextUsage { .. })),
+            "过期 flight 的 replay context_usage 不得产出 ContextUsage 事件"
         );
     }
 }

@@ -224,6 +224,58 @@ fn tool_block_display_round_trips_and_absent_omits_field() {
     assert!(value.get("display").is_none());
 }
 
+/// 会话级占用块 golden：null 回合标识、固定 block_id，serde 必须无损往返。
+#[test]
+fn context_usage_block_round_trips_and_keeps_null_turn_ids() {
+    let raw = include_str!("fixtures/kit_wire/context_usage_event.json");
+    let event: KitProductEvent =
+        serde_json::from_str(raw).expect("context_usage golden 必须可解码");
+
+    let KitBlock::ContextUsage {
+        used_tokens_estimate,
+        context_window_tokens,
+        percent_estimate,
+        measured_at_ms,
+    } = &event.block
+    else {
+        panic!("fixture 必须是 context_usage block");
+    };
+    assert_eq!(*used_tokens_estimate, 45_000);
+    assert_eq!(*context_window_tokens, 200_000);
+    assert_eq!(*percent_estimate, 22);
+    assert_eq!(*measured_at_ms, 1_790_000_000_000);
+    assert_eq!(event.turn_id, None);
+    assert_eq!(event.submission_id, None);
+    assert_eq!(event.block_id, "context_usage");
+    assert_eq!(event.origin, efflab_agent_host::Origin::Live);
+    event
+        .validate()
+        .expect("null 回合标识的 context_usage 必须通过出站校验");
+
+    let round_trip = serde_json::to_value(&event).expect("context_usage 必须可重序列化");
+    let expected: serde_json::Value = serde_json::from_str(raw).expect("golden 必须是 JSON");
+    assert_eq!(round_trip, expected);
+}
+
+/// 占用快照是估算信号，不是 transcript：伪造回合标识必须 fail-closed。
+#[test]
+fn context_usage_block_rejects_turn_identifiers() {
+    let event = event(
+        KitBlock::ContextUsage {
+            used_tokens_estimate: 10,
+            context_window_tokens: 100,
+            percent_estimate: 10,
+            measured_at_ms: 1,
+        },
+        Some("turn"),
+        Some("turn"),
+    );
+    assert!(
+        event.validate().is_err(),
+        "携带 turn/submission 的 context_usage 必须被 Host 出站边界拒绝"
+    );
+}
+
 /// session 级状态事件可没有 turn/submission，并按 Host 事件 ID 合成规则编码。
 #[test]
 fn session_level_status_allows_null_turn_id() {

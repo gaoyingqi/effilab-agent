@@ -50,6 +50,9 @@ const NOTIFICATION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// usage 内部上报的 ACP ext notification 逻辑方法名；wire 上是 `_x.ai/turn_usage`，
 /// Host 在投影前内部化该通知，不进 Kit event、journal 或 analytics。
 const TURN_USAGE_METHOD: &str = "x.ai/turn_usage";
+/// 会话级上下文占用估算的 ACP ext notification 逻辑方法名；wire 上是
+/// `_x.ai/context_usage`，Host 投影为 live-only 的 `KitBlock::ContextUsage`。
+const CONTEXT_USAGE_METHOD: &str = "x.ai/context_usage";
 // 为 JSON line 的记录类型、id 和结构字段预留空间，避免正文刚好达到 line 上限。
 const MAX_ASSISTANT_TEXT_BYTES: usize = MAX_RECORD_LINE_BYTES.saturating_sub(1024);
 
@@ -215,6 +218,8 @@ pub struct TurnLoop {
     ready_tools: BTreeSet<String>,
     /// 已解析的系统提示词，作为每轮模型请求的第一条 system 消息。
     system_prompt: String,
+    /// 已由 runtime config 校验的上下文压缩设置；V1 配置回退到固定默认。
+    compact: crate::compact::CompactSettings,
     /// debug 构建中的测试执行 spy；release 构建不携带测试接缝。
     #[cfg(debug_assertions)]
     test_seam: Option<TestSeam>,
@@ -230,6 +235,7 @@ impl TurnLoop {
         expected_tools: BTreeSet<String>,
         ready_tools: BTreeSet<String>,
         system_prompt: String,
+        compact: crate::compact::CompactSettings,
     ) -> Self {
         Self {
             repository,
@@ -239,6 +245,7 @@ impl TurnLoop {
             expected_tools,
             ready_tools,
             system_prompt,
+            compact,
             #[cfg(debug_assertions)]
             test_seam: None,
         }
@@ -545,7 +552,12 @@ impl TurnLoop {
                 }
                 Err(error) => {
                     return self
-                        .finish_failed(session_id, prompt_id, &control, error)
+                        .finish_failed(
+                            session_id,
+                            prompt_id,
+                            &control,
+                            error,
+                        )
                         .await;
                 }
             }
@@ -681,7 +693,7 @@ impl TurnLoop {
         }
     }
 
-    /// 生产固定 200k 窗口阈值；debug 测试可通过 seam 文件压低，不走环境变量。
+    /// 由已验证 runtime config 驱动压缩阈值；debug 测试可通过 seam 文件压低，不走环境变量。
     fn compact_threshold_tokens_for_turn(&self) -> u64 {
         #[cfg(debug_assertions)]
         if let Some(tokens) = self
@@ -691,10 +703,10 @@ impl TurnLoop {
         {
             return tokens;
         }
-        crate::compact::compact_threshold_tokens()
+        self.compact.threshold_tokens()
     }
 
-    /// 在首轮模型调用前按固定 200k 窗口粗估 token；超阈值则摘要更早回合。
+    /// 在首轮模型调用前按已验证窗口估算 token；超阈值则摘要更早回合。
     async fn maybe_compact(
         &self,
         session_id: &str,
@@ -1444,6 +1456,28 @@ impl TurnLoop {
                 test_seam.mark("terminal_committed");
                 test_seam.wait_if_enabled("after_terminal_claim").await;
             }
+            // terminal 落盘后向 Host 报告当前会话上下文占用估算。上报整体移出
+            // turn 关键路径：detached 任务内完成 journal 重载与通知入队，
+            // PromptResponse 不等估算也不等通知写入，慢 IO 不再成为串行尾延迟。
+            let repository = self.repository.clone();
+            let expected_tools = self.expected_tools.clone();
+            let ready_tools = self.ready_tools.clone();
+            let system_prompt = self.system_prompt.clone();
+            let compact = self.compact;
+            let gateway = self.gateway.clone();
+            let session = session_id.to_string();
+            tokio::task::spawn_local(async move {
+                report_context_usage(
+                    repository,
+                    expected_tools,
+                    ready_tools,
+                    system_prompt,
+                    compact,
+                    gateway,
+                    session,
+                )
+                .await;
+            });
             Ok((acp::PromptResponse::new(stop_reason), claim.kind))
         } else {
             // 防御性分支：同一 control 不重复追加 terminal，调用方复用已提交结果。
@@ -1559,6 +1593,87 @@ fn safe_mcp_result_for_model(result: &McpCallResult) -> String {
 pub(crate) fn is_safe_transcript_tool_name(name: &str) -> bool {
     (name == NOOP_TOOL || contract_is_qualified_tool_name(name))
         && name.len() <= MAX_RECORD_ID_BYTES
+}
+
+/// 用给定 journal 快照估算会话上下文占用并经 ACP ext notification 上报 Host。
+/// 估算与 `x.ai/turn_usage` 的模型记账相互独立：该通道只承载估算值，不含
+/// prompt/模型正文；任何失败只记日志并跳过，不阻塞、不改变调用方结果。
+///
+/// 通知以 fire-and-forget 入队，不等 outgoing writer 完成：估算快照是可以
+/// 丢失的尽力信号，等待 writer（最长 NOTIFICATION_DELIVERY_TIMEOUT）只会把
+/// 传输拥塞传染给上游调用方。
+async fn report_context_usage(
+    repository: SessionRepository,
+    expected_tools: BTreeSet<String>,
+    ready_tools: BTreeSet<String>,
+    system_prompt: String,
+    compact: crate::compact::CompactSettings,
+    gateway: AcpGatewaySender<acp::AgentSide>,
+    session_id: String,
+) {
+    let session = match repository
+        .load_with_tool_policy(&session_id, &expected_tools, &ready_tools)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::debug!(
+                event = "context_usage_report_failed",
+                error_code = error.code(),
+                "会话加载失败，跳过上下文占用上报"
+            );
+            return;
+        }
+    };
+    emit_context_usage_estimate(
+        &session.records,
+        &system_prompt,
+        compact,
+        &gateway,
+        &session_id,
+    );
+}
+
+/// 对已加载的 journal records 做一次占用估算并立即上报；同步、无等待，
+/// 供重连/会话加载路径在不重读 journal 的情况下补发新 live 快照。
+pub(crate) fn emit_context_usage_estimate(
+    records: &[SessionRecord],
+    system_prompt: &str,
+    compact: crate::compact::CompactSettings,
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    session_id: &str,
+) {
+    let used_tokens_estimate =
+        crate::compact::estimate_messages_tokens(&transcript_messages(records, system_prompt));
+    let context_window_tokens = compact.context_window_tokens;
+    // window 经 contract 校验大于零；估算允许超过 100%，如实反映超窗程度。
+    let percent_estimate = used_tokens_estimate
+        .saturating_mul(100)
+        .checked_div(context_window_tokens)
+        .unwrap_or(u64::MAX);
+    let measured_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .ok()
+        .and_then(|millis| u64::try_from(millis).ok())
+        .unwrap_or(0);
+    let params = match serde_json::value::to_raw_value(&json!({
+        "sessionId": session_id,
+        "usedTokensEstimate": used_tokens_estimate,
+        "contextWindowTokens": context_window_tokens,
+        "percentEstimate": percent_estimate,
+        "measuredAtMs": measured_at_ms
+    })) {
+        Ok(params) => params,
+        Err(_) => return,
+    };
+    let notification = acp::ExtNotification::new(CONTEXT_USAGE_METHOD, params.into());
+    if !gateway.forward_fire_and_forget(notification) {
+        tracing::debug!(
+            event = "context_usage_report_failed",
+            "上下文占用上报未能入队；仅丢失估算快照，调用方继续"
+        );
+    }
 }
 
 /// 将已持久化的白名单 records 转成模型上下文，并按 round 恢复成对消息。

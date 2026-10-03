@@ -14,7 +14,8 @@ use serde::Serialize;
 use crate::mcp_config::{is_qualified_tool_name, is_server_name};
 use crate::stdio_mcp::deny_stdio_mcp;
 use crate::{
-    ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RuntimeConfigV1, SidecarModelSpec,
+    ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RUNTIME_SCHEMA_VERSION_V2,
+    RuntimeConfigV1, RuntimeConfigV2, SidecarModelSpec,
 };
 
 const RUNTIME_SCHEMA_VERSION: u32 = 1;
@@ -25,6 +26,17 @@ const MAX_RUNTIME_PATH_BYTES: usize = 4096;
 const MAX_RUNTIME_MODEL_ID_CHARS: usize = 128;
 /// 产品系统提示词的字节上限，避免把无界文本写入 sidecar 启动配置。
 const MAX_SYSTEM_PROMPT_BYTES: usize = 32_768;
+
+/// Host 写出的 V1 runtime 配置文件名；sidecar 仍接受该文件名以保持向后兼容。
+pub const RUNTIME_CONFIG_V1_FILENAME: &str = "runtime-config.v1.toml";
+/// M5 起 Host 写出的 V2 runtime 配置文件名。
+pub const RUNTIME_CONFIG_V2_FILENAME: &str = "runtime-config.v2.toml";
+/// `context_window_tokens` 的上界：远超任何现有模型窗口，保证 `* percent / 100` 不溢出 u64。
+const MAX_CONTEXT_WINDOW_TOKENS: u64 = 100_000_000;
+/// `compact_threshold_percent` 的下界；0 会让阈值乘积为 0，导致压缩死循环。
+const MIN_COMPACT_THRESHOLD_PERCENT: u64 = 1;
+/// `compact_threshold_percent` 的上界；超过 100 意味着压缩永远不会触发。
+const MAX_COMPACT_THRESHOLD_PERCENT: u64 = 100;
 
 /// 物化 AgentDefinition 与权威配置中使用的固定 agent 名称。
 const DEFAULT_AGENT_NAME: &str = "efflab-default";
@@ -93,10 +105,92 @@ pub fn render_runtime_config_v1(config: &RuntimeConfigV1) -> Result<String> {
     Ok(rendered)
 }
 
+/// 渲染 M5 V2 runtime 配置，并以不含自身的规范化 JSON 重新计算 revision。
+///
+/// 与 V1 renderer 共用同一套字段顺序与 stdio 拒绝规则；V2 只在标量区追加两个
+/// 已验证字段，因此生成的 TOML 结构仍与 V1 保持同一布局约定。
+pub fn render_runtime_config_v2(config: &RuntimeConfigV2) -> Result<String> {
+    // 与 V1 使用同一 helper，避免 renderer 产生任何可执行 stdio 配置。
+    deny_stdio_mcp(&config.approved_mcp)?;
+    validate_runtime_config_v2(config)?;
+
+    let mut materialized = config.clone();
+    materialized.runtime_revision = calculate_runtime_revision_v2(&materialized)?;
+    let mut rendered = String::new();
+    rendered.push_str("schema_version = ");
+    rendered.push_str(&materialized.schema_version.to_string());
+    rendered.push_str("\nruntime_revision = ");
+    rendered.push_str(&runtime_toml_string(&materialized.runtime_revision));
+    rendered.push_str("\nsession_store_version = ");
+    rendered.push_str(&materialized.session_store_version.to_string());
+    rendered.push_str("\nsession_cwd = ");
+    rendered.push_str(&runtime_toml_string(&materialized.session_cwd));
+    rendered.push_str("\nexpected_tools = ");
+    rendered.push_str(&runtime_toml_string_array(&materialized.expected_tools));
+    rendered.push_str("\nsystem_prompt = ");
+    rendered.push_str(&runtime_toml_string(&materialized.system_prompt));
+    rendered.push_str("\ncontext_window_tokens = ");
+    rendered.push_str(&materialized.context_window_tokens.to_string());
+    rendered.push_str("\ncompact_threshold_percent = ");
+    rendered.push_str(&materialized.compact_threshold_percent.to_string());
+    rendered.push_str("\n\n[model]\nmodel_id = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.model_id));
+    rendered.push_str("\nbase_url = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.base_url));
+    rendered.push_str("\nbackend = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.backend));
+    rendered.push_str("\ntoken_env = ");
+    rendered.push_str(&runtime_toml_string(&materialized.model.token_env));
+
+    if materialized.approved_mcp.servers.is_empty() {
+        rendered.push_str("\n\n[approved_mcp]\nservers = {}\n");
+    } else {
+        for (name, server) in &materialized.approved_mcp.servers {
+            let McpServerSpec::Http { url } = server else {
+                bail!("stdio_mcp_unavailable");
+            };
+            rendered.push_str("\n\n[approved_mcp.servers.");
+            rendered.push_str(&runtime_toml_key_literal(name));
+            rendered.push_str("]\nurl = ");
+            rendered.push_str(&runtime_toml_string(url));
+            rendered.push('\n');
+        }
+    }
+
+    toml::from_str::<RuntimeConfigV2>(&rendered)
+        .context("内部错误：生成的 RuntimeConfigV2 TOML 不是合法 schema")?;
+    Ok(rendered)
+}
+
 /// 从 Host 写出的 v1 TOML 读取配置，并在任何后续使用前完成闭集与 revision 校验。
 pub fn load_runtime_config_v1(path: &Path) -> Result<RuntimeConfigV1> {
     let source = fs::read_to_string(path).context("读取 RuntimeConfigV1 TOML 失败")?;
     load_runtime_config_v1_from_str(&source)
+}
+
+/// 从 Host 写出的 v2 TOML 读取配置，并在任何后续使用前完成闭集与 revision 校验。
+pub fn load_runtime_config_v2(path: &Path) -> Result<RuntimeConfigV2> {
+    let source = fs::read_to_string(path).context("读取 RuntimeConfigV2 TOML 失败")?;
+    load_runtime_config_v2_from_str(&source)
+}
+
+/// 校验已经由调用方安全读取的 v2 TOML 文本；与 V1 共用同一 fail-closed 协议。
+///
+/// `context_window_tokens`/`compact_threshold_percent` 的上下界在此统一收口，
+/// 越界输入拒绝加载而不是截断静默。
+pub fn load_runtime_config_v2_from_str(source: &str) -> Result<RuntimeConfigV2> {
+    // 丢弃 TOML parser 的原始错误；未知字段和 MCP server 名可能来自不可信 runtime wire。
+    let config: RuntimeConfigV2 =
+        toml::from_str(source).map_err(|_| anyhow::anyhow!("runtime_config_invalid"))?;
+
+    // stdio 必须在 revision 等其他策略校验之前统一走 helper，保持稳定错误码。
+    deny_stdio_mcp(&config.approved_mcp)?;
+    validate_runtime_config_v2(&config)?;
+    let expected_revision = calculate_runtime_revision_v2(&config)?;
+    if config.runtime_revision != expected_revision {
+        bail!("runtime_revision 校验失败：配置摘要与不含自身的规范化 JSON 不一致");
+    }
+    Ok(config)
 }
 
 /// 校验 Host/sidecar 共用的绝对 UTF-8 session cwd 词法合同。
@@ -183,21 +277,68 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
     if config.schema_version != RUNTIME_SCHEMA_VERSION {
         bail!("schema_version 必须为 {RUNTIME_SCHEMA_VERSION}");
     }
-    if config.session_store_version != RUNTIME_SESSION_STORE_VERSION {
+    validate_runtime_common(
+        config.session_store_version,
+        &config.session_cwd,
+        &config.expected_tools,
+        &config.system_prompt,
+        &config.model,
+        &config.approved_mcp,
+    )
+}
+
+/// 校验 RuntimeConfigV2 的版本、新增压缩字段边界，以及与 V1 共用的全部约束。
+fn validate_runtime_config_v2(config: &RuntimeConfigV2) -> Result<()> {
+    if config.schema_version != RUNTIME_SCHEMA_VERSION_V2 {
+        bail!("schema_version 必须为 {RUNTIME_SCHEMA_VERSION_V2}");
+    }
+    if config.context_window_tokens == 0 {
+        bail!("context_window_tokens 必须大于 0，避免阈值乘积为 0");
+    }
+    if config.context_window_tokens > MAX_CONTEXT_WINDOW_TOKENS {
+        bail!("context_window_tokens 不能超过 {MAX_CONTEXT_WINDOW_TOKENS}，避免阈值乘积溢出");
+    }
+    if !(MIN_COMPACT_THRESHOLD_PERCENT..=MAX_COMPACT_THRESHOLD_PERCENT)
+        .contains(&config.compact_threshold_percent)
+    {
+        bail!(
+            "compact_threshold_percent 必须落在 {MIN_COMPACT_THRESHOLD_PERCENT}..={MAX_COMPACT_THRESHOLD_PERCENT}"
+        );
+    }
+    validate_runtime_common(
+        config.session_store_version,
+        &config.session_cwd,
+        &config.expected_tools,
+        &config.system_prompt,
+        &config.model,
+        &config.approved_mcp,
+    )
+}
+
+/// V1/V2 共享的固定字段校验；两版字段语义完全一致，差异只在新数字字段与 schema_version。
+fn validate_runtime_common(
+    session_store_version: u32,
+    session_cwd: &str,
+    expected_tools: &BTreeSet<String>,
+    system_prompt: &str,
+    model: &LoopbackModelSpec,
+    approved_mcp: &ApprovedMcpConfig,
+) -> Result<()> {
+    if session_store_version != RUNTIME_SESSION_STORE_VERSION {
         bail!("session_store_version 必须为 {RUNTIME_SESSION_STORE_VERSION}");
     }
-    validate_session_cwd(&config.session_cwd)?;
+    validate_session_cwd(session_cwd)?;
 
     // expected_tools 与 Host 审核摘要复用同一 qualified-name 语法。
     // tool 长度与完整名称的记录上限仍由 sidecar 运行时处理。
-    for tool in &config.expected_tools {
+    for tool in expected_tools {
         if !is_qualified_tool_name(tool) {
             bail!("expected_tools 包含非法 MCP qualified tool 名称");
         }
     }
-    validate_system_prompt(&config.system_prompt)?;
+    validate_system_prompt(system_prompt)?;
 
-    let model_id = &config.model.model_id;
+    let model_id = &model.model_id;
     if model_id.is_empty() {
         bail!("model.model_id 不能为空");
     }
@@ -208,18 +349,18 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
     {
         bail!("model.model_id 必须匹配 ^[A-Za-z0-9._:-]+$ 且不超过 128 个字符");
     }
-    if config.model.backend != RUNTIME_BACKEND {
+    if model.backend != RUNTIME_BACKEND {
         bail!("model.backend 必须为 {RUNTIME_BACKEND}");
     }
-    if config.model.token_env != RUNTIME_TOKEN_ENV {
+    if model.token_env != RUNTIME_TOKEN_ENV {
         bail!("model.token_env 必须为 {RUNTIME_TOKEN_ENV}");
     }
-    if literal_loopback_http_path(&config.model.base_url) != Some("/v1") {
+    if literal_loopback_http_path(&model.base_url) != Some("/v1") {
         bail!("model.base_url 必须是字面量 loopback HTTP 且 path 精确为 /v1");
     }
 
-    for (name, server) in &config.approved_mcp.servers {
-        // RuntimeConfigV1 的 map key 与 qualified name 共用同一 server 边界。
+    for (name, server) in &approved_mcp.servers {
+        // RuntimeConfig 的 map key 与 qualified name 共用同一 server 边界。
         if !is_server_name(name) {
             bail!("approved_mcp.servers.name_invalid");
         }
@@ -230,7 +371,7 @@ fn validate_runtime_config_v1(config: &RuntimeConfigV1) -> Result<()> {
                 }
             }
             McpServerSpec::Stdio { .. } => {
-                // load_runtime_config_v1 已在此函数前调用 deny_stdio_mcp。
+                // 各版本 loader 已在此函数前调用 deny_stdio_mcp。
                 bail!("stdio_mcp_unavailable");
             }
         }
@@ -296,6 +437,56 @@ fn calculate_runtime_revision(config: &RuntimeConfigV1) -> Result<String> {
     };
     let canonical_json =
         serde_json::to_vec(&payload).context("规范化 RuntimeConfigV1 JSON 失败")?;
+    let digest = Sha256::digest(&canonical_json);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
+/// 生成 V2 revision 使用的字段顺序固定、且不包含 runtime_revision 的 JSON 投影。
+///
+/// V2 字段在 V1 顺序之后追加，保证同一逻辑内容在两版摘要中分别稳定。
+#[derive(Serialize)]
+struct RuntimeRevisionPayloadV2<'a> {
+    schema_version: u32,
+    session_store_version: u32,
+    session_cwd: &'a str,
+    model: &'a LoopbackModelSpec,
+    approved_mcp: RuntimeRevisionMcp<'a>,
+    expected_tools: &'a BTreeSet<String>,
+    system_prompt: &'a str,
+    context_window_tokens: u64,
+    compact_threshold_percent: u64,
+}
+
+/// 以纯 Rust SHA-256 计算 V2 runtime revision；摘要输入比 V1 多两个已验证字段。
+fn calculate_runtime_revision_v2(config: &RuntimeConfigV2) -> Result<String> {
+    let servers = config
+        .approved_mcp
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            let McpServerSpec::Http { url } = server else {
+                return Err(anyhow::anyhow!("stdio_mcp_unavailable"));
+            };
+            Ok((name.as_str(), RuntimeRevisionServer { url: url.as_str() }))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let payload = RuntimeRevisionPayloadV2 {
+        schema_version: config.schema_version,
+        session_store_version: config.session_store_version,
+        session_cwd: &config.session_cwd,
+        model: &config.model,
+        approved_mcp: RuntimeRevisionMcp { servers },
+        expected_tools: &config.expected_tools,
+        system_prompt: &config.system_prompt,
+        context_window_tokens: config.context_window_tokens,
+        compact_threshold_percent: config.compact_threshold_percent,
+    };
+    let canonical_json =
+        serde_json::to_vec(&payload).context("规范化 RuntimeConfigV2 JSON 失败")?;
     let digest = Sha256::digest(&canonical_json);
     let hex = digest
         .iter()

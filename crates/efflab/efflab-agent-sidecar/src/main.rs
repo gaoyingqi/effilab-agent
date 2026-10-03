@@ -1,6 +1,6 @@
 //! efflab-agent-sidecar 的最小 ACP 运行时入口。
 //!
-//! 启动边界负责受控 CLI、RuntimeConfigV1、私有 home 和 stderr 日志；ACP 方法由
+//! 启动边界负责受控 CLI、版本化 runtime 配置、私有 home 和 stderr 日志；ACP 方法由
 //! `runtime` 中的 current-thread Tokio + LocalSet 接管，stdout 只保留 JSON-RPC。
 //!
 //! 启动顺序：管理命令 → CLI/stdio 门禁 → 平台 capability → L3b binding →
@@ -70,10 +70,16 @@ fn main() -> ExitCode {
     // tracing 固定写 stderr；stdout 由 ACP gateway 作为唯一 writer 接管。
     tracing::debug!(event = "startup", "sidecar startup boundary passed");
     if sidecar.used_deprecated_alias {
-        tracing::warn!(reason = "deprecated_alias", "deprecated --grok-home alias ignored");
+        tracing::warn!(
+            reason = "deprecated_alias",
+            "deprecated --grok-home alias ignored"
+        );
     }
     if sidecar.legacy_config_present {
-        tracing::warn!(reason = "ignored_legacy_config", "legacy config.toml ignored");
+        tracing::warn!(
+            reason = "ignored_legacy_config",
+            "legacy config.toml ignored"
+        );
     }
 
     // 锁句柄贯穿整个进程生命周期，避免同一 home 出现两个 sidecar writer。
@@ -127,9 +133,7 @@ fn main() -> ExitCode {
 
 /// 输出启动拒绝的固定英文阶段和错误码，不回显参数、路径或底层错误链。
 fn report_startup_rejection(stage: &'static str, error_code: &'static str) {
-    eprintln!(
-        "efflab-agent-sidecar: startup_rejected stage={stage} error_code={error_code}"
-    );
+    eprintln!("efflab-agent-sidecar: startup_rejected stage={stage} error_code={error_code}");
 }
 
 /// 将 runtime config 边界中少数稳定错误映射为日志错误码。

@@ -498,6 +498,21 @@ pub enum KitBlock {
     Retry { attempt: u32, reason_code: String },
     /// 会话或回合状态。
     Status { code: String, message: String },
+    /// 会话级上下文占用快照；只承载估算值，不含 prompt/模型原文。
+    ///
+    /// 由 sidecar 在回合收敛后估算并经 Host 合成 live 快照：turn_id 与
+    /// submission_id 必须为 null，同会话使用固定 block_id；它是 live-only 信号，
+    /// 不进入可恢复 transcript，journal replay 不重放。
+    ContextUsage {
+        /// 当前会话上下文已占用的估算 token 数。
+        used_tokens_estimate: u64,
+        /// 已验证 runtime config 的上下文窗口上限（token）。
+        context_window_tokens: u64,
+        /// 占用百分比估算；基于近似 token 计数，并非模型记账值。
+        percent_estimate: u64,
+        /// sidecar 测量时刻的 Unix epoch 毫秒。
+        measured_at_ms: u64,
+    },
     /// 未知类型的安全降级；原 payload 有意丢弃。
     Unknown { unknown_kind: String },
 }
@@ -523,6 +538,7 @@ impl<'de> Deserialize<'de> for KitBlock {
             "error" => serde_json::from_value::<ErrorBlock>(value).map(Into::into),
             "retry" => serde_json::from_value::<RetryBlock>(value).map(Into::into),
             "status" => serde_json::from_value::<StatusBlock>(value).map(Into::into),
+            "context_usage" => serde_json::from_value::<ContextUsageBlock>(value).map(Into::into),
             "unknown" => serde_json::from_value::<UnknownBlock>(value).map(Into::into),
             _ => Ok(Self::Unknown { unknown_kind: kind }),
         }
@@ -591,6 +607,19 @@ impl Serialize for KitBlock {
                 message: message.clone(),
             }
             .serialize(serializer),
+            Self::ContextUsage {
+                used_tokens_estimate,
+                context_window_tokens,
+                percent_estimate,
+                measured_at_ms,
+            } => ContextUsageBlock {
+                kind: "context_usage".to_string(),
+                used_tokens_estimate: *used_tokens_estimate,
+                context_window_tokens: *context_window_tokens,
+                percent_estimate: *percent_estimate,
+                measured_at_ms: *measured_at_ms,
+            }
+            .serialize(serializer),
             Self::Unknown { unknown_kind } => UnknownBlock {
                 kind: "unknown".to_string(),
                 unknown_kind: unknown_kind.clone(),
@@ -642,6 +671,8 @@ impl KitProductEvent {
             KitBlock::Status { code, .. } if is_session_status(code) => {
                 self.validate_session_identifiers()
             }
+            // 会话级占用快照同样禁止伪造回合标识，与 session Status 共用 null 不变量。
+            KitBlock::ContextUsage { .. } => self.validate_session_identifiers(),
             _ => Ok(()),
         }
     }
@@ -699,7 +730,11 @@ pub fn is_recoverable_product_event(event: &KitProductEvent) -> bool {
         KitBlock::Status { code, .. } => {
             matches!(code.as_str(), "turn_completed" | "cancelled" | "error")
         }
-        KitBlock::Error(_) | KitBlock::Retry { .. } | KitBlock::Unknown { .. } => false,
+        // ContextUsage 是 live-only 会话快照：永不进入 transcript，replay 不重放。
+        KitBlock::ContextUsage { .. }
+        | KitBlock::Error(_)
+        | KitBlock::Retry { .. }
+        | KitBlock::Unknown { .. } => false,
     }
 }
 
@@ -901,6 +936,16 @@ struct StatusBlock {
     message: String,
 }
 
+/// 内标 context_usage block；字段全部是估算值，不携带任何原文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextUsageBlock {
+    kind: String,
+    used_tokens_estimate: u64,
+    context_window_tokens: u64,
+    percent_estimate: u64,
+    measured_at_ms: u64,
+}
+
 /// 内标 unknown block。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UnknownBlock {
@@ -1061,6 +1106,18 @@ impl From<StatusBlock> for KitBlock {
     }
 }
 
+/// 将 context_usage wire DTO 转成公开 block。
+impl From<ContextUsageBlock> for KitBlock {
+    fn from(block: ContextUsageBlock) -> Self {
+        Self::ContextUsage {
+            used_tokens_estimate: block.used_tokens_estimate,
+            context_window_tokens: block.context_window_tokens,
+            percent_estimate: block.percent_estimate,
+            measured_at_ms: block.measured_at_ms,
+        }
+    }
+}
+
 /// 将 unknown wire DTO 转成公开 block。
 impl From<UnknownBlock> for KitBlock {
     fn from(block: UnknownBlock) -> Self {
@@ -1089,5 +1146,29 @@ mod tests {
         let debug = format!("{command:?}");
         assert!(!debug.contains(secret));
         assert!(debug.contains("[REDACTED; len="));
+    }
+
+    /// ContextUsage 是 live-only 快照：不进可恢复白名单，replay 永不重放旧占用。
+    #[test]
+    fn context_usage_event_is_not_recoverable() {
+        let event = KitProductEvent {
+            schema_version: KIT_SCHEMA_VERSION,
+            scope_id: "scope".to_string(),
+            session_id: "session".to_string(),
+            turn_id: None,
+            submission_id: None,
+            event_id: "session:host:context_usage:0".to_string(),
+            sequence: 0,
+            origin: Origin::Live,
+            block_id: "context_usage".to_string(),
+            block: KitBlock::ContextUsage {
+                used_tokens_estimate: 100,
+                context_window_tokens: 200_000,
+                percent_estimate: 0,
+                measured_at_ms: 1,
+            },
+        };
+        assert!(!is_recoverable_product_event(&event));
+        event.validate().expect("会话级占用快照必须通过出站不变量");
     }
 }

@@ -19,7 +19,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use efflab_agent_contract::{LoopbackModelSpec, RuntimeConfigV1, render_runtime_config_v1};
+use efflab_agent_contract::{
+    DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_CONTEXT_WINDOW_TOKENS, LoopbackModelSpec,
+    RUNTIME_CONFIG_V2_FILENAME, RUNTIME_SCHEMA_VERSION_V2, RuntimeConfigV2,
+    render_runtime_config_v2,
+};
 #[cfg(not(windows))]
 use xai_tty_utils::detach_std_command;
 use xai_tty_utils::{ProcessGroup, ProcessScope, detach_std_command_suspended};
@@ -35,10 +39,8 @@ use efflab_agent_platform as platform;
 pub const STDIN_CLOSE_GRACE: Duration = Duration::from_millis(3_500);
 /// 发出终止请求后等待 sidecar 退出的固定宽限期。
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
-/// Host 与 v1 sidecar 之间唯一共享的 runtime 配置文件名。
-const RUNTIME_CONFIG_FILENAME: &str = "runtime-config.v1.toml";
-/// RuntimeConfigV1 固定 schema 版本。
-const RUNTIME_SCHEMA_VERSION: u32 = 1;
+/// Host 写出的 M5 V2 runtime 配置文件名；sidecar 仍接受旧 V1 文件名。
+const RUNTIME_CONFIG_FILENAME: &str = RUNTIME_CONFIG_V2_FILENAME;
 /// RuntimeConfigV1 固定 session store 版本。
 const RUNTIME_SESSION_STORE_VERSION: u32 = 1;
 /// sidecar 连接 Host L3b 时唯一允许的后端。
@@ -1286,7 +1288,7 @@ fn force_reap_slot_on_supervisor_drop(slot: &Arc<ScopeSlot>) {
     }
 }
 
-/// 用本代批准 MCP 规格构造 sidecar 唯一可读的 v1 runtime 配置。
+/// 用本代批准 MCP 规格构造 sidecar 唯一可读的 V2 runtime 配置。
 fn render_runtime_config(
     paths: &ScopePaths,
     model_id: &str,
@@ -1299,8 +1301,8 @@ fn render_runtime_config(
         .to_str()
         .ok_or(SupervisorError::ConfigRenderFailed)?
         .to_owned();
-    let config = RuntimeConfigV1 {
-        schema_version: RUNTIME_SCHEMA_VERSION,
+    let config = RuntimeConfigV2 {
+        schema_version: RUNTIME_SCHEMA_VERSION_V2,
         runtime_revision: String::new(),
         session_store_version: RUNTIME_SESSION_STORE_VERSION,
         session_cwd,
@@ -1313,6 +1315,8 @@ fn render_runtime_config(
         approved_mcp: approved_mcp.servers().clone(),
         expected_tools: approved_mcp.expected_tools().clone(),
         system_prompt: system_prompt.to_owned(),
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
     };
     tracing::debug!(
         event = "runtime_config_system_prompt",
@@ -1320,8 +1324,8 @@ fn render_runtime_config(
         prompt_bytes = system_prompt.len(),
         "Host 正在渲染 sidecar 系统提示词"
     );
-    render_runtime_config_v1(&config).map_err(|_| {
-        tracing::error!("RuntimeConfigV1 渲染失败，拒绝启动 sidecar");
+    render_runtime_config_v2(&config).map_err(|_| {
+        tracing::error!("RuntimeConfigV2 渲染失败，拒绝启动 sidecar");
         SupervisorError::ConfigRenderFailed
     })
 }

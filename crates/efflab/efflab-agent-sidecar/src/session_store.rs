@@ -3673,10 +3673,7 @@ mod tests {
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("设置 home 权限");
         let repository = SessionRepository::new(&home);
         let session = repository.create().await.expect("创建 v1 session");
-        let session_dir = home
-            .join("efflab-sessions")
-            .join("v1")
-            .join(&session.id);
+        let session_dir = home.join("efflab-sessions").join("v1").join(&session.id);
         assert_eq!(
             fs::symlink_metadata(&session_dir)
                 .expect("读取新建 session 目录元数据")

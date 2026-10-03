@@ -849,9 +849,11 @@ fn tool_display_absolute_path(text: &str) -> bool {
 /// 只按字符迭代，不跨 UTF-8 边界切片。
 fn tool_display_ends_with_file_token(head: &str) -> bool {
     let mut chars = head.chars().rev();
-    let token_matches = ['e', 'l', 'i', 'f']
-        .into_iter()
-        .all(|want| chars.next().is_some_and(|got| got.eq_ignore_ascii_case(&want)));
+    let token_matches = ['e', 'l', 'i', 'f'].into_iter().all(|want| {
+        chars
+            .next()
+            .is_some_and(|got| got.eq_ignore_ascii_case(&want))
+    });
     token_matches && tool_display_path_boundary(chars.next())
 }
 

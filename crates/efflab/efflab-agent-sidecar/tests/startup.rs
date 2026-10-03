@@ -1,6 +1,6 @@
 //! sidecar Task 12 启动边界的黑盒测试。
 //!
-//! 测试从真实二进制验证 v1 runtime config、home alias、私有权限、退出码和 stdout
+//! 测试从真实二进制验证版本化 runtime config、home alias、私有权限、退出码和 stdout
 //! 隔离；fixture 全部在临时目录中生成，不读取或修改仓库内配置。
 
 use std::collections::BTreeSet;
@@ -12,7 +12,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use efflab_agent_contract::{
-    ApprovedMcpConfig, LoopbackModelSpec, RuntimeConfigV1, render_runtime_config_v1,
+    ApprovedMcpConfig, LoopbackModelSpec, RuntimeConfigV2, render_runtime_config_v2,
 };
 use efflab_agent_sidecar::hardening::MAX_RUNTIME_CONFIG_BYTES;
 use fs2::FileExt;
@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 const SIDECAR_BIN: &str = env!("CARGO_BIN_EXE_efflab-agent-sidecar");
 const HOME_LOCK_FILENAME: &str = ".efflab-sidecar.lock";
-const RUNTIME_CONFIG_FILENAME: &str = "runtime-config.v1.toml";
+const RUNTIME_CONFIG_FILENAME: &str = "runtime-config.v2.toml";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
@@ -178,7 +178,7 @@ fn fixture_tempdir() -> TempDir {
 }
 
 impl Fixture {
-    /// 创建一个可被 Host 写入的 runtime-config.v1 fixture。
+    /// 创建一个可被 Host 写入的 runtime-config.v2 fixture。
     fn new() -> Self {
         let temporary = fixture_tempdir();
         let session_cwd = temporary.path().join("session");
@@ -209,7 +209,7 @@ impl Fixture {
         }
     }
 
-    /// 返回默认的 v1 CLI 参数；调用方可在其后追加 alias 参数。
+    /// 返回默认的 v2 CLI 参数；调用方可在其后追加 alias 参数。
     fn args(&self) -> Vec<String> {
         vec![
             "--runtime-config".to_owned(),
@@ -242,10 +242,10 @@ impl Fixture {
     }
 }
 
-/// 写入由 contract renderer 生成的合法 v1 配置，并应用各平台的私有文件约束。
+/// 写入由 contract renderer 生成的合法 v2 配置，并应用各平台的私有文件约束。
 fn write_valid_runtime_config(path: &Path, session_cwd: &Path, mode: u32) {
-    let config = RuntimeConfigV1 {
-        schema_version: 1,
+    let config = RuntimeConfigV2 {
+        schema_version: 2,
         runtime_revision: String::new(),
         session_store_version: 1,
         session_cwd: session_cwd
@@ -261,8 +261,10 @@ fn write_valid_runtime_config(path: &Path, session_cwd: &Path, mode: u32) {
         approved_mcp: ApprovedMcpConfig::default(),
         expected_tools: BTreeSet::new(),
         system_prompt: String::new(),
+        context_window_tokens: 200_000,
+        compact_threshold_percent: 70,
     };
-    let rendered = render_runtime_config_v1(&config).expect("生成合法 runtime config");
+    let rendered = render_runtime_config_v2(&config).expect("生成合法 runtime config");
     #[cfg(unix)]
     {
         fs::write(path, rendered).expect("写入 runtime config");
@@ -397,7 +399,10 @@ fn assert_rejected(status: ExitStatus, stdout: &str, stderr: &str, _context: &st
         Some(2),
         "startup rejection must exit=2; stdout={stdout:?}; stderr={stderr:?}"
     );
-    assert!(stdout.is_empty(), "startup rejection must not write stdout: {stdout:?}");
+    assert!(
+        stdout.is_empty(),
+        "startup rejection must not write stdout: {stdout:?}"
+    );
     assert!(
         stderr.contains("startup_rejected"),
         "stderr must contain the stable startup rejection marker: {stderr:?}"
@@ -452,7 +457,7 @@ fn runtime_config_is_required_and_legacy_shell_config_is_not_read() {
     assert_eq!(
         fs::read_to_string(&legacy_path).expect("读取 legacy shell config"),
         legacy_content,
-        "缺少 v1 参数时不得读取、修复或覆盖 legacy config.toml"
+        "缺少 runtime 配置参数时不得读取、修复或覆盖 legacy config.toml"
     );
     assert!(
         !fixture.home.join(HOME_LOCK_FILENAME).exists(),
@@ -638,9 +643,9 @@ fn valid_eof_has_exit_zero_and_invalid_runtime_config_has_exit_two() {
     let (status, stdout, stderr) = run_to_completion(fixture.command(&fixture.args()));
     assert_clean_eof(status, &stdout, &stderr);
 
-    let valid_source = fs::read_to_string(&fixture.runtime_config).expect("读取合法 v1 config");
-    let invalid_source = valid_source.replacen("schema_version = 1", "schema_version = 999", 1);
-    fs::write(&fixture.runtime_config, invalid_source).expect("写入无效 v1 config");
+    let valid_source = fs::read_to_string(&fixture.runtime_config).expect("读取合法 v2 config");
+    let invalid_source = valid_source.replacen("schema_version = 2", "schema_version = 999", 1);
+    fs::write(&fixture.runtime_config, invalid_source).expect("写入无效 v2 config");
     set_mode(&fixture.runtime_config, 0o600);
 
     let (invalid_status, invalid_stdout, invalid_stderr) =

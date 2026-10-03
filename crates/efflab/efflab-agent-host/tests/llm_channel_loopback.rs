@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use efflab_agent_contract::load_runtime_config_v1_from_str;
+use efflab_agent_contract::load_runtime_config_v2_from_str;
 use efflab_agent_host::{
     ApprovedMcpConfig, ApprovedMcpSpec, HostApp, HostRuntimeConfig, L3bLoopback, L3bRuntimeConfig,
     LlmChannelConfig, LlmChannelError, LlmChannelKind, LlmChannelManager, LlmChannelService,
@@ -1168,7 +1168,7 @@ fn real_launch_and_rotation_keep_user_keys_out_of_sidecar_environment() {
         .join("loopback-test-app")
         .join("library-a");
     let expected_home = expected_scope_root.join("home");
-    let expected_runtime_config = expected_home.join("runtime-config.v1.toml");
+    let expected_runtime_config = expected_home.join("runtime-config.v2.toml");
     let expected_session_cwd = expected_scope_root.join("workspace");
     let expected_session_cwd = expected_session_cwd
         .to_str()
@@ -1244,13 +1244,13 @@ done
 [ -n "$runtime_config" ] || exit 32
 [ -n "$session_cwd" ] || exit 33
 test "$home" = "$expected_home" || exit 34
-test "$runtime_config" = "$home/runtime-config.v1.toml" || exit 35
+test "$runtime_config" = "$home/runtime-config.v2.toml" || exit 35
 test "$session_cwd" = "$expected_session_cwd" || exit 36
 test -n "$EFFLAB_L3B_BIND" || exit 35
 /usr/bin/env | /usr/bin/grep -q '^XAI_API_KEY=' && exit 36
 /usr/bin/env | /usr/bin/grep -q '^GROK_CODE_XAI_API_KEY=' && exit 37
 test -f "$runtime_config" || exit 38
-/usr/bin/grep -q '^schema_version = 1$' "$runtime_config" || exit 39
+/usr/bin/grep -q '^schema_version = 2$' "$runtime_config" || exit 39
 /usr/bin/grep -q '^backend = "chat_completions"$' "$runtime_config" || exit 40
 /usr/bin/grep -q '^token_env = "EFFLAB_L3B_BIND"$' "$runtime_config" || exit 41
 generation=1
@@ -1341,11 +1341,11 @@ while IFS= read -r _; do :; done
     );
 
     // loader 成功返回即表示 Host 写出的配置满足 schema、stdio 与 runtime_revision 约束。
-    let config = load_runtime_config_v1_from_str(&runtime_config_text)
+    let config = load_runtime_config_v2_from_str(&runtime_config_text)
         .unwrap_or_else(|_| panic!("Host 写出的 runtime config 必须通过 contract loader 校验"));
     assert!(
-        config.schema_version == 1,
-        "runtime config schema version 必须为 1"
+        config.schema_version == 2,
+        "runtime config schema version 必须为 2"
     );
     assert!(
         config.session_store_version == 1,

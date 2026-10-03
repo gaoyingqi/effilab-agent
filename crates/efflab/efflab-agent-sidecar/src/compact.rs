@@ -1,19 +1,57 @@
-//! sidecar 精简上下文压缩：按固定 200k 窗口估算，超阈值后对更早回合做一次摘要。
+//! sidecar 精简上下文压缩：按 runtime config 已验证的窗口估算，超阈值后对更早回合做一次摘要。
 //!
-//! 不提供用户可配置的上下文长度；失败时跳过压缩、不改写已有 journal。
+//! 窗口与阈值由 RuntimeConfig 驱动（V1 回退到固定默认，V2 使用已校验字段）；
+//! 失败时跳过压缩、不改写已有 journal。
 
+use efflab_agent_contract::{
+    DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_CONTEXT_WINDOW_TOKENS, RuntimeConfig,
+};
 use serde_json::Value;
 
 use crate::session_store::SessionRecord;
 
-/// 产品默认模型上下文窗口（token）；不向用户开放设置。
-pub const CONTEXT_WINDOW_TOKENS: u64 = 200_000;
-/// 触发压缩的窗口占用百分比，给当前回合的模型输出预留余量。
-pub const COMPACT_THRESHOLD_PERCENT: u64 = 70;
+/// V1 runtime 配置隐含的模型上下文窗口（token），与 contract V2 默认值同源。
+pub const CONTEXT_WINDOW_TOKENS: u64 = DEFAULT_CONTEXT_WINDOW_TOKENS;
+/// V1 runtime 配置隐含的窗口占用百分比，给当前回合的模型输出预留余量。
+pub const COMPACT_THRESHOLD_PERCENT: u64 = DEFAULT_COMPACT_THRESHOLD_PERCENT;
 /// 压缩后仍按原文保留的最近用户回合数（含当前 prompt）。
 pub const COMPACT_KEEP_USER_TURNS: usize = 2;
 /// 摘要正文上限，避免 compact 记录撑满 journal 行。
 const COMPACT_SUMMARY_MAX_CHARS: usize = 32_768;
+
+/// 已通过 contract 校验的压缩设置；V1 加载回退到编译期默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactSettings {
+    /// 模型上下文窗口估算（token），大于 0 且有上界。
+    pub context_window_tokens: u64,
+    /// 触发压缩的窗口占用百分比，落在 `(0, 100]`。
+    pub compact_threshold_percent: u64,
+}
+
+impl CompactSettings {
+    /// V1 配置没有这两个字段时的原编译期默认值。
+    pub fn v1_defaults() -> Self {
+        Self {
+            context_window_tokens: CONTEXT_WINDOW_TOKENS,
+            compact_threshold_percent: COMPACT_THRESHOLD_PERCENT,
+        }
+    }
+
+    /// 从已校验的版本化 runtime 配置读取压缩设置。
+    pub fn from_runtime_config(config: &RuntimeConfig) -> Self {
+        Self {
+            context_window_tokens: config.context_window_tokens(),
+            compact_threshold_percent: config.compact_threshold_percent(),
+        }
+    }
+
+    /// 计算触发压缩的 token 阈值；contract 校验保证乘法不会溢出 u64。
+    pub fn threshold_tokens(&self) -> u64 {
+        self.context_window_tokens
+            .saturating_mul(self.compact_threshold_percent)
+            / 100
+    }
+}
 
 /// 摘要模型使用的固定说明；不要求调用工具。
 pub const COMPACT_REQUEST_PROMPT: &str = "\
@@ -23,13 +61,6 @@ Do not call tools. Reply with the summary only.";
 
 /// 压缩后插入模型上下文的助手确认，避免连续两条 user 消息。
 pub const COMPACT_ACK: &str = "Understood. I will continue from this summary.";
-
-/// 生产压缩阈值。窗口固定 200k，不向用户开放，也不读环境变量。
-///
-/// debug 测试若要压低阈值，必须走 `TestSeam` 文件；sidecar 启动会 `sanitize_env`。
-pub fn compact_threshold_tokens() -> u64 {
-    CONTEXT_WINDOW_TOKENS.saturating_mul(COMPACT_THRESHOLD_PERCENT) / 100
-}
 
 /// 粗估 token：按字符数 / 2，偏保守以便中文更早触发压缩。
 pub fn estimate_text_tokens(text: &str) -> u64 {
@@ -112,7 +143,7 @@ pub fn summary_messages(summary: &str) -> [Value; 2] {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPACT_KEEP_USER_TURNS, CONTEXT_WINDOW_TOKENS, compact_prefix_end, compact_threshold_tokens,
+        COMPACT_KEEP_USER_TURNS, CONTEXT_WINDOW_TOKENS, CompactSettings, compact_prefix_end,
         estimate_text_tokens, truncate_summary,
     };
     use crate::session_store::SessionRecord;
@@ -126,10 +157,23 @@ mod tests {
     }
 
     #[test]
-    fn production_threshold_is_seventy_percent_of_200k() {
+    fn v1_default_threshold_is_seventy_percent_of_200k() {
         assert_eq!(CONTEXT_WINDOW_TOKENS, 200_000);
-        assert_eq!(compact_threshold_tokens(), 140_000);
+        assert_eq!(CompactSettings::v1_defaults().threshold_tokens(), 140_000);
         assert_eq!(COMPACT_KEEP_USER_TURNS, 2);
+    }
+
+    #[test]
+    fn configured_settings_drive_threshold_instead_of_constants() {
+        let settings = CompactSettings {
+            context_window_tokens: 1_000,
+            compact_threshold_percent: 80,
+        };
+        assert_eq!(settings.threshold_tokens(), 800);
+        assert_ne!(
+            settings.threshold_tokens(),
+            CompactSettings::v1_defaults().threshold_tokens()
+        );
     }
 
     #[test]

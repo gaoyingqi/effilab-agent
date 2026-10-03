@@ -1,0 +1,1 @@
+{"schema_version":1,"scope_id":"s","session_id":"sid","turn_id":null,"submission_id":null,"event_id":"sid:host:context_usage:7","sequence":7,"origin":"live","block_id":"context_usage","block":{"kind":"context_usage","used_tokens_estimate":45000,"context_window_tokens":200000,"percent_estimate":22,"measured_at_ms":1790000000000}}

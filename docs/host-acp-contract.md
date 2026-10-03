@@ -97,7 +97,15 @@ sidecar → Host，**不**走 `validate_host_request`（那是出站库）。
 | `plan` / `todo` / `available_commands_update` 等禁用或非 M1 块 | **跳过并内部计数**（projector 计数器 + debug 日志），**不再发送** `replay_skipped` / `skipped_update` 可见 Status。**不失败整轮** |
 | 未知 `sessionUpdate` 变体 | 同上，禁止把原始 ACP 当 generic data 甩给 web |
 | `_x.ai/session/update` 扩展 | M1 **丢弃**并内部计数（debug 日志），不算错误；不生成可见 Status |
+| `_x.ai/turn_usage` 扩展 | 内部化给 `HostApp::observe_turn_usage`；不进 Kit wire/journal/analytics；损坏载荷只计数 |
+| `_x.ai/context_usage` 扩展 | 投影为会话级 `KitBlock::ContextUsage` live 快照（`turn_id/submission_id=null`、固定 `block_id=context_usage`、递增 sequence）；不进可恢复 transcript、replay 不重放（`_meta.isReplay=true` 的载荷一律拒绝并内部计数，即便属于当前 load flight）；损坏载荷只计数。发射时机见 §4.1.1 |
 | 非 JSON / 非 ACP stdout | 视为污染：杀进程 + Kit `Error` |
+
+#### 4.1.1 `_x.ai/context_usage` 发射语义（sidecar）
+
+- **触发点**：① 回合 terminal 落盘后；② `session/load` 回放完成、会话激活后（records 非空时）。load 后补发的是**新估算的 live 快照**（不带 `isReplay`），用于 Host 恢复点重算，而非恢复旧占用。
+- **与响应的关系**：两处触发均为 detached 任务 + `forward_fire_and_forget` 入队，不等 outgoing writer 完成；PromptResponse / LoadResponse **不等待**估算或通知写入，慢 IO 不构成串行尾延迟。通知相对 response 的先后顺序不保证。
+- **失败语义**：任何一步失败（加载、序列化、入队）只记 debug 日志并丢弃该次快照；估算丢失不改变回合/加载结果。
 
 `session/update` 的 `sessionId` 只用于将事件归属到对应会话；一个 scope 进程可同时维护多个 active session，`current_session` 只是最近一次 `session/new` / `session/load` 指针，不限制其它 active session 的 live update、transcript 或 hot resume。
 

@@ -244,15 +244,15 @@ pub async fn run_acp(
     // MCP handshake 在 ACP dispatcher 创建前完成，避免未 ready 的 server 被错误广告；
     // runtime clone 会贯穿 agent、turn loop 和 EOF cleanup 三个生命周期边界。
     let mcp = McpRuntime::new(
-        sidecar.runtime_config.approved_mcp.clone(),
-        sidecar.runtime_config.expected_tools.clone(),
+        sidecar.runtime_config.approved_mcp().clone(),
+        sidecar.runtime_config.expected_tools().clone(),
     )
     .await
     .map_err(|error| anyhow::anyhow!("sidecar mcp runtime unavailable: {}", error.code()))?;
-    let system_prompt = crate::resolve_system_prompt(&sidecar.runtime_config.system_prompt);
+    let system_prompt = crate::resolve_system_prompt(sidecar.runtime_config.system_prompt());
     tracing::debug!(
         event = "system_prompt_resolved",
-        host_configured = !sidecar.runtime_config.system_prompt.trim().is_empty(),
+        host_configured = !sidecar.runtime_config.system_prompt().trim().is_empty(),
         prompt_bytes = system_prompt.len(),
         "已解析 sidecar 系统提示词"
     );
@@ -260,9 +260,10 @@ pub async fn run_acp(
         sidecar.session_cwd.clone(),
         repository,
         model,
-        sidecar.runtime_config.expected_tools.clone(),
+        sidecar.runtime_config.expected_tools().clone(),
         mcp.clone(),
-        sidecar.runtime_config.system_prompt.clone(),
+        sidecar.runtime_config.system_prompt().to_owned(),
+        crate::compact::CompactSettings::from_runtime_config(&sidecar.runtime_config),
     );
     #[cfg(debug_assertions)]
     let test_seam = sidecar.test_seam_dir.clone().map(TestSeam::new);

@@ -242,10 +242,10 @@ done
 [ -n "$home" ] || exit 2
 [ -n "$runtime_config" ] || exit 2
 [ -n "$session_cwd" ] || exit 2
-[ "$runtime_config" = "$home/runtime-config.v1.toml" ] || exit 2
+[ "$runtime_config" = "$home/runtime-config.v2.toml" ] || exit 2
 [ -n "$EFFLAB_L3B_BIND" ] || exit 3
 test -f "$runtime_config" || exit 3
-/usr/bin/grep -q '^schema_version = 1$' "$runtime_config" || exit 3
+/usr/bin/grep -q '^schema_version = 2$' "$runtime_config" || exit 3
 /usr/bin/grep -q '^backend = "chat_completions"$' "$runtime_config" || exit 3
 /usr/bin/grep -q '^token_env = "EFFLAB_L3B_BIND"$' "$runtime_config" || exit 3
 
@@ -391,7 +391,7 @@ fn task19_fake_sidecar_rejects_legacy_home_and_config_fallback() {
     assert_eq!(
         fallback_status.code(),
         Some(2),
-        "canonical v1 fake 缺少 runtime-config.v1.toml 时必须返回 exit=2"
+        "canonical v2 fake 缺少 runtime-config.v2.toml 时必须返回 exit=2"
     );
 }
 
@@ -405,10 +405,10 @@ fn task19_fake_sidecar_rejects_unknown_or_forged_acp_method() {
     fs::create_dir(&home).expect("创建 fake sidecar home 应成功");
     fs::create_dir(&session_cwd).expect("创建 fake sidecar workspace 应成功");
     fs::write(
-        home.join("runtime-config.v1.toml"),
-        b"schema_version = 1\nbackend = \"chat_completions\"\ntoken_env = \"EFFLAB_L3B_BIND\"\n",
+        home.join("runtime-config.v2.toml"),
+        b"schema_version = 2\nbackend = \"chat_completions\"\ntoken_env = \"EFFLAB_L3B_BIND\"\n",
     )
-    .expect("写入最小 v1 runtime config 应成功");
+    .expect("写入最小 v2 runtime config 应成功");
 
     let sidecar_path = temporary.path().join("fake-sidecar.sh");
     let args_path = temporary.path().join("captured-args");
@@ -429,7 +429,7 @@ fn task19_fake_sidecar_rejects_unknown_or_forged_acp_method() {
     let mut child = Command::new(&sidecar_path)
         .args([
             "--runtime-config",
-            home.join("runtime-config.v1.toml")
+            home.join("runtime-config.v2.toml")
                 .to_str()
                 .expect("runtime config 路径必须是 UTF-8"),
             "--home",
@@ -470,15 +470,15 @@ fn task19_fake_sidecar_rejects_unknown_or_forged_acp_method() {
     );
 }
 
-/// Supervisor 必须物化 v1 runtime config，并将用户端点、Key 和环境秘密隔离在 Host 内。
+/// Supervisor 必须物化 v2 runtime config，并将用户端点、Key 和环境秘密隔离在 Host 内。
 #[cfg(unix)]
 #[test]
-fn supervisor_passes_v1_config_and_never_passes_secret_or_user_endpoint() {
+fn supervisor_passes_v2_config_and_never_passes_secret_or_user_endpoint() {
     let temporary = tempfile::tempdir().expect("创建 Task19 临时目录应成功");
     let root_with_space = temporary.path().join("app data");
     let expected_runtime_config = root_with_space
         .join("task19-supervisor-test")
-        .join("scope-a/home/runtime-config.v1.toml");
+        .join("scope-a/home/runtime-config.v2.toml");
     let args_path = temporary.path().join("captured-args");
     let env_path = temporary.path().join("captured-env");
     let binding_marker_path = temporary.path().join("binding-marker");
@@ -545,9 +545,9 @@ fn supervisor_passes_v1_config_and_never_passes_secret_or_user_endpoint() {
     assert_eq!(
         args.lines().collect::<Vec<_>>(),
         vec!["--runtime-config", "--home", "--session-cwd", "--stdio"],
-        "fake sidecar 只能观察固定 v1 参数名"
+        "fake sidecar 只能观察固定 v2 参数名"
     );
-    assert!(runtime_config.contains("schema_version = 1"));
+    assert!(runtime_config.contains("schema_version = 2"));
     assert!(runtime_config.contains("demo__search"));
     assert!(runtime_config.contains("http://127.0.0.1:4313/mcp"));
     assert!(child_env.lines().any(|name| name == "EFFLAB_L3B_BIND"));
@@ -636,7 +636,7 @@ fn host_runtime_dispatches_non_empty_mcp_through_real_v1_launch() {
 
     let expected_runtime_config = root_with_space
         .join("task19-supervisor-test")
-        .join("scope-a/home/runtime-config.v1.toml");
+        .join("scope-a/home/runtime-config.v2.toml");
     wait_for_file(&args_path);
     wait_for_file(&env_path);
     wait_for_file(&binding_marker_path);

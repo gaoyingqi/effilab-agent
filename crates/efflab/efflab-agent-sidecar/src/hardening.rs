@@ -11,6 +11,7 @@ use std::path::Path;
 use efflab_agent_platform as platform;
 
 use anyhow::{Context, Result, bail};
+use efflab_agent_contract::{RUNTIME_CONFIG_V1_FILENAME, RUNTIME_CONFIG_V2_FILENAME};
 #[cfg(any(unix, windows))]
 use fs2::FileExt;
 #[cfg(unix)]
@@ -34,8 +35,14 @@ const FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
 const HOME_LOCK_FILENAME: &str = ".efflab-sidecar.lock";
 const L3B_BIND_ENV: &str = "EFFLAB_L3B_BIND";
-/// RuntimeConfigV1 的固定读取上限，防止启动阶段无界分配。
+/// 版本化 runtime 配置的固定读取上限，防止启动阶段无界分配。
 pub const MAX_RUNTIME_CONFIG_BYTES: usize = 64 * 1024;
+
+/// 判断文件名是否属于已声明的 runtime 配置版本（V1 或 V2）。
+fn is_runtime_config_filename(filename: &std::ffi::OsStr) -> bool {
+    filename == std::ffi::OsStr::new(RUNTIME_CONFIG_V1_FILENAME)
+        || filename == std::ffi::OsStr::new(RUNTIME_CONFIG_V2_FILENAME)
+}
 
 /// Windows 与 Unix 都必须先通过共享的文件系统硬化边界。
 pub fn ensure_platform_supported() -> Result<()> {
@@ -117,8 +124,8 @@ impl StartupHandles {
     pub fn read_private_runtime_config(&self, path: &Path) -> Result<String> {
         require_absolute_path(path, "--runtime-config")?;
         let filename = path.file_name().context("--runtime-config 必须指向文件")?;
-        if filename != std::ffi::OsStr::new("runtime-config.v1.toml") {
-            bail!("--runtime-config 必须指向 runtime-config.v1.toml");
+        if !is_runtime_config_filename(filename) {
+            bail!("--runtime-config 必须指向已声明版本的 runtime-config.vN.toml");
         }
         match read_private_runtime_config_at(&self.home_directory, filename) {
             Ok(source) => Ok(source),
@@ -194,17 +201,15 @@ impl StartupHandles {
     /// 从已钉住的 home 目录句柄读取固定 runtime config。
     pub fn read_private_runtime_config(&self, path: &Path) -> Result<String> {
         require_absolute_path(path, "--runtime-config")?;
-        if path.file_name() != Some(std::ffi::OsStr::new("runtime-config.v1.toml")) {
-            bail!("--runtime-config 必须指向 runtime-config.v1.toml");
+        let filename = path.file_name().context("--runtime-config 必须指向文件")?;
+        if !is_runtime_config_filename(filename) {
+            bail!("--runtime-config 必须指向已声明版本的 runtime-config.vN.toml");
         }
         let bytes = self
             .platform
-            .read_private_file(
-                std::ffi::OsStr::new("runtime-config.v1.toml"),
-                MAX_RUNTIME_CONFIG_BYTES,
-            )
+            .read_private_file(filename, MAX_RUNTIME_CONFIG_BYTES)
             .context("从受保护 home 读取 runtime config 失败")?;
-        String::from_utf8(bytes).context("读取 RuntimeConfigV1 TOML 失败")
+        String::from_utf8(bytes).context("读取 runtime config TOML 失败")
     }
 
     /// 只检查已钉住 home 下的旧配置目录项。
@@ -324,9 +329,12 @@ pub fn acquire_home_lock(_home: &Path) -> Result<File> {
 #[cfg(unix)]
 pub fn read_private_runtime_config(path: &Path) -> Result<String> {
     require_absolute_path(path, "--runtime-config")?;
+    let filename = path.file_name().context("--runtime-config 必须指向文件")?;
+    if !is_runtime_config_filename(filename) {
+        bail!("--runtime-config 必须指向已声明版本的 runtime-config.vN.toml");
+    }
     let parent = path.parent().context("--runtime-config 缺少父目录")?;
     let parent_directory = open_existing_directory(parent, "--runtime-config 父目录")?;
-    let filename = path.file_name().context("--runtime-config 必须指向文件")?;
     read_private_runtime_config_at(&parent_directory, filename)
 }
 
@@ -353,7 +361,7 @@ fn read_private_runtime_config_at(parent: &File, filename: &std::ffi::OsStr) -> 
     (&file)
         .take(MAX_RUNTIME_CONFIG_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .context("读取 RuntimeConfigV1 TOML 失败")?;
+        .context("读取 runtime config TOML 失败")?;
     if bytes.len() > MAX_RUNTIME_CONFIG_BYTES {
         tracing::debug!(
             event = "runtime_config_rejected",
@@ -363,7 +371,7 @@ fn read_private_runtime_config_at(parent: &File, filename: &std::ffi::OsStr) -> 
         bail!("runtime_config_invalid");
     }
 
-    let source = String::from_utf8(bytes).context("读取 RuntimeConfigV1 TOML 失败")?;
+    let source = String::from_utf8(bytes).context("读取 runtime config TOML 失败")?;
     tracing::debug!(
         event = "runtime_config_read",
         "runtime config 已从受保护 fd 读取"
@@ -375,12 +383,12 @@ fn read_private_runtime_config_at(parent: &File, filename: &std::ffi::OsStr) -> 
 #[cfg(windows)]
 pub fn read_private_runtime_config(path: &Path) -> Result<String> {
     require_absolute_path(path, "--runtime-config")?;
-    if path.file_name() != Some(std::ffi::OsStr::new("runtime-config.v1.toml")) {
-        bail!("--runtime-config 必须指向 runtime-config.v1.toml");
+    if !path.file_name().is_some_and(is_runtime_config_filename) {
+        bail!("--runtime-config 必须指向已声明版本的 runtime-config.vN.toml");
     }
     let bytes = platform::read_private_file(path, MAX_RUNTIME_CONFIG_BYTES)
-        .context("读取 RuntimeConfigV1 TOML 失败")?;
-    String::from_utf8(bytes).context("读取 RuntimeConfigV1 TOML 失败")
+        .context("读取 runtime config TOML 失败")?;
+    String::from_utf8(bytes).context("读取 runtime config TOML 失败")
 }
 
 /// 未实现平台在 capability 关闭期间不读取 runtime config。

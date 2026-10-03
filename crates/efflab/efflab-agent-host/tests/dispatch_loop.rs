@@ -992,19 +992,19 @@ done
 [ "$home_count" -eq 1 ] || exit 22
 [ "$session_cwd_count" -eq 1 ] || exit 23
 [ "$stdio_count" -eq 1 ] || exit 24
-# spawn 前必须已有由 Host 写入的 v1 配置与本代 binding；绝不落盘 token 本体。
+# spawn 前必须已有由 Host 写入的 V2 配置与本代 binding；绝不落盘 token 本体。
 case "$home" in
   "$expected_scope_root/scope-a/home") expected_scope_cwd="$expected_scope_root/scope-a/workspace" ;;
   "$expected_scope_root/scope-b/home") expected_scope_cwd="$expected_scope_root/scope-b/workspace" ;;
   *) exit 25 ;;
 esac
 test "$session_cwd" = "$expected_scope_cwd" || exit 26
-test "$runtime_config" = "$home/runtime-config.v1.toml" || exit 27
+test "$runtime_config" = "$home/runtime-config.v2.toml" || exit 27
 test -n "$EFFLAB_L3B_BIND" || exit 41
 test -n "$home" || exit 42
 test -n "$runtime_config" || exit 43
 test -f "$runtime_config" || exit 44
-/usr/bin/grep -q '^schema_version = 1$' "$runtime_config" || exit 46
+/usr/bin/grep -q '^schema_version = 2$' "$runtime_config" || exit 46
 /usr/bin/grep -q '^backend = "chat_completions"$' "$runtime_config" || exit 47
 /usr/bin/grep -q '^token_env = "EFFLAB_L3B_BIND"$' "$runtime_config" || exit 48
 /usr/bin/grep -q '^session_cwd = ' "$runtime_config" || exit 49
@@ -1502,9 +1502,9 @@ fn launch_handshake_new_session_skips_empty_mcp_catalog_and_keeps_stdio_wired() 
         ._temporary
         .path()
         .join("app-data/dispatch-loop-test/scope-a/home");
-    let config = fs::read_to_string(home.join("runtime-config.v1.toml"))
-        .expect("Host 必须在 fake sidecar spawn 前写入 runtime-config.v1.toml");
-    assert!(config.contains("schema_version = 1"));
+    let config = fs::read_to_string(home.join("runtime-config.v2.toml"))
+        .expect("Host 必须在 fake sidecar spawn 前写入 runtime-config.v2.toml");
+    assert!(config.contains("schema_version = 2"));
     assert!(config.contains("backend = \"chat_completions\""));
     assert!(config.contains("token_env = \"EFFLAB_L3B_BIND\""));
     assert!(config.contains("system_prompt = \"\""));

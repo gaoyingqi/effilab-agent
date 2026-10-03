@@ -3,9 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use efflab_agent_contract::{
-    ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RuntimeConfigV1,
-    is_literal_loopback_http_url, is_prompt_id, is_qualified_tool_name, load_runtime_config_v1,
-    load_runtime_config_v1_from_str, render_runtime_config_v1,
+    ApprovedMcpConfig, LoopbackModelSpec, McpServerSpec, RuntimeConfig, RuntimeConfigV1,
+    RuntimeConfigV2, is_literal_loopback_http_url, is_prompt_id, is_qualified_tool_name,
+    load_runtime_config_v1, load_runtime_config_v1_from_str, load_runtime_config_v2,
+    load_runtime_config_v2_from_str, render_runtime_config_v1, render_runtime_config_v2,
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -29,6 +30,12 @@ fn fixture_source(name: &str) -> &'static str {
         "runtime_config_v1_expected_tools_under_servers.toml" => {
             include_str!("fixtures/runtime_config_v1_expected_tools_under_servers.toml")
         }
+        "runtime_config_v2_empty.toml" => {
+            include_str!("fixtures/runtime_config_v2_empty.toml")
+        }
+        "runtime_config_v2_http_mcp.toml" => {
+            include_str!("fixtures/runtime_config_v2_http_mcp.toml")
+        }
         _ => panic!("未知 runtime config fixture: {name}"),
     }
 }
@@ -38,6 +45,13 @@ fn materialize_fixture_source(name: &str) -> String {
     let source = materialize_cwd(fixture_source(name));
     let template: RuntimeConfigV1 = toml::from_str(&source).expect("fixture 模板必须可解析");
     source.replace(REVISION_PLACEHOLDER, &independent_revision(&template))
+}
+
+/// V2 fixture 版本：同样替换 cwd 占位符，并用 V2 独立摘要填充 revision。
+fn materialize_fixture_source_v2(name: &str) -> String {
+    let source = materialize_cwd(fixture_source(name));
+    let template: RuntimeConfigV2 = toml::from_str(&source).expect("V2 fixture 模板必须可解析");
+    source.replace(REVISION_PLACEHOLDER, &independent_revision_v2(&template))
 }
 
 /// 测试只生成目标平台合法的绝对 cwd，不把本机路径写入 fixture。
@@ -81,6 +95,35 @@ fn write_config(config: &RuntimeConfigV1) -> (TempDir, PathBuf) {
     write_config_source(&rendered)
 }
 
+/// V2 变体：渲染后以 `runtime-config.v2.toml` 文件名落盘。
+fn write_config_v2(config: &RuntimeConfigV2) -> (TempDir, PathBuf) {
+    let rendered = render_runtime_config_v2(config).expect("V2 配置必须可渲染");
+    write_config_source_v2(&rendered)
+}
+
+fn write_config_source_v2(source: &str) -> (TempDir, PathBuf) {
+    let directory = tempfile::tempdir().expect("创建配置临时目录应成功");
+    let path = directory.path().join("runtime-config.v2.toml");
+    fs::write(&path, source).expect("写入配置临时文件应成功");
+    (directory, path)
+}
+
+/// V2 策略负测：篡改后按 V2 payload 独立重算 revision，避免被摘要失败掩盖。
+fn write_tampered_config_v2(
+    config: &RuntimeConfigV2,
+    tamper: impl FnOnce(String) -> String,
+) -> (TempDir, PathBuf) {
+    let rendered = render_runtime_config_v2(config).expect("V2 基准配置必须可渲染");
+    let source = with_independent_revision_v2(&tamper(rendered));
+    write_config_source_v2(&source)
+}
+
+fn with_independent_revision_v2(source: &str) -> String {
+    let config: RuntimeConfigV2 =
+        toml::from_str(source).expect("V2 策略负测必须保持 schema 可解析");
+    source.replace(&config.runtime_revision, &independent_revision_v2(&config))
+}
+
 /// 修改后重算独立 revision，使策略负测不会被旧摘要错误掩盖。
 fn write_tampered_config(
     config: &RuntimeConfigV1,
@@ -117,6 +160,17 @@ fn assert_loader_error(source: &str, expected: &str) {
     assert!(
         rendered.contains(expected),
         "错误应包含 {expected:?}，实际为: {rendered}"
+    );
+}
+
+/// V2 loader 变体：从已读文本直接断言，避免路径语义混入策略断言。
+fn assert_loader_error_v2(source: &str, expected: &str) {
+    let error =
+        load_runtime_config_v2_from_str(source).expect_err("非法 V2 runtime config 必须拒绝");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(expected),
+        "V2 错误应包含 {expected:?}，实际为: {rendered}"
     );
 }
 
@@ -816,6 +870,59 @@ fn independent_revision(config: &RuntimeConfigV1) -> String {
     )
 }
 
+/// V2 revision 的独立投影：字段顺序必须与 production RuntimeRevisionPayloadV2 一致。
+#[derive(Serialize)]
+struct TestRevisionPayloadV2<'a> {
+    schema_version: u32,
+    session_store_version: u32,
+    session_cwd: &'a str,
+    model: TestModelPayload<'a>,
+    approved_mcp: TestApprovedMcpPayload<'a>,
+    expected_tools: &'a BTreeSet<String>,
+    system_prompt: &'a str,
+    context_window_tokens: u64,
+    compact_threshold_percent: u64,
+}
+
+/// V2 canonical JSON：测试侧独立构造，不能调用 production renderer 的摘要投影。
+fn canonical_revision_json_v2(config: &RuntimeConfigV2) -> String {
+    let servers = config
+        .approved_mcp
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            let McpServerSpec::Http { url } = server else {
+                panic!("V2 golden revision 不允许 stdio MCP")
+            };
+            (name.as_str(), TestMcpServerPayload { url: url.as_str() })
+        })
+        .collect();
+    let payload = TestRevisionPayloadV2 {
+        schema_version: config.schema_version,
+        session_store_version: config.session_store_version,
+        session_cwd: &config.session_cwd,
+        model: TestModelPayload {
+            model_id: &config.model.model_id,
+            base_url: &config.model.base_url,
+            backend: &config.model.backend,
+            token_env: &config.model.token_env,
+        },
+        approved_mcp: TestApprovedMcpPayload { servers },
+        expected_tools: &config.expected_tools,
+        system_prompt: &config.system_prompt,
+        context_window_tokens: config.context_window_tokens,
+        compact_threshold_percent: config.compact_threshold_percent,
+    };
+    serde_json::to_string(&payload).expect("V2 测试 canonical JSON 必须可序列化")
+}
+
+fn independent_revision_v2(config: &RuntimeConfigV2) -> String {
+    format!(
+        "sha256:{}",
+        independent_sha256_hex(canonical_revision_json_v2(config).as_bytes())
+    )
+}
+
 /// 独立 SHA-256 实现仅服务测试 golden 与负测摘要重算。
 fn independent_sha256_hex(input: &[u8]) -> String {
     const K: [u32; 64] = [
@@ -1011,4 +1118,228 @@ fn prompt_id_helper_enforces_non_empty_control_free_byte_boundary() {
         !is_prompt_id(&"é".repeat(513)),
         "超过 1024 UTF-8 bytes 应拒绝"
     );
+}
+
+/// 构造合法 V2 配置；所有 V2 测试共用同一基线形状，只改关注字段。
+fn runtime_config_v2_fixture() -> RuntimeConfigV2 {
+    RuntimeConfigV2 {
+        schema_version: 2,
+        runtime_revision: String::new(),
+        session_store_version: 1,
+        session_cwd: session_cwd_string(),
+        model: LoopbackModelSpec {
+            model_id: "byok-user-model".to_owned(),
+            base_url: "http://127.0.0.1:4312/v1".to_owned(),
+            backend: "chat_completions".to_owned(),
+            token_env: "EFFLAB_L3B_BIND".to_owned(),
+        },
+        approved_mcp: ApprovedMcpConfig::default(),
+        expected_tools: BTreeSet::new(),
+        system_prompt: String::new(),
+        context_window_tokens: 200_000,
+        compact_threshold_percent: 70,
+    }
+}
+
+/// V2 渲染输出必须能回读为同值配置，且字段顺序保持 schema_version→新增字段→表。
+#[test]
+fn runtime_config_v2_round_trips_with_rendered_defaults() {
+    let config = runtime_config_v2_fixture();
+    let rendered = render_runtime_config_v2(&config).expect("V2 配置必须可渲染");
+    assert!(rendered.contains("schema_version = 2"));
+    assert!(rendered.contains("context_window_tokens = 200000"));
+    assert!(rendered.contains("compact_threshold_percent = 70"));
+    assert!(
+        rendered.find("context_window_tokens").unwrap() < rendered.find("[model]").unwrap(),
+        "新增标量必须在 [model] 表之前渲染"
+    );
+    let parsed = load_runtime_config_v2_from_str(&rendered).expect("V2 渲染输出必须可回读");
+    assert_eq!(parsed.context_window_tokens, 200_000);
+    assert_eq!(parsed.compact_threshold_percent, 70);
+    assert_eq!(parsed.schema_version, 2);
+}
+
+/// V2 缺失新增字段时必须回落到 200k/70% 默认，而不是拒绝或硬编码零值。
+#[test]
+fn runtime_config_v2_missing_compact_fields_default_to_200k_70() {
+    let rendered =
+        render_runtime_config_v2(&runtime_config_v2_fixture()).expect("基准 V2 配置必须可渲染");
+    let missing = rendered
+        .replace("context_window_tokens = 200000\n", "")
+        .replace("compact_threshold_percent = 70\n", "");
+    let parsed =
+        load_runtime_config_v2_from_str(&missing).expect("缺失新增字段的 V2 配置必须按默认值加载");
+    assert_eq!(parsed.context_window_tokens, 200_000);
+    assert_eq!(parsed.compact_threshold_percent, 70);
+}
+
+/// V1 文件内容进入 V2 入口会因 schema_version 判别失败，V2 loader 不会吞错。
+#[test]
+fn runtime_config_v2_loader_rejects_v1_schema_version() {
+    let source = materialize_fixture_source("runtime_config_v1_empty.toml");
+    assert_loader_error_v2(&source, "schema_version");
+}
+
+/// V2 磁盘 fixture 必须能经 from_str loader 走通字段与 revision 双重校验。
+#[test]
+fn runtime_config_v2_fixtures_round_trip_through_loader() {
+    let empty = materialize_fixture_source_v2("runtime_config_v2_empty.toml");
+    let parsed = load_runtime_config_v2_from_str(&empty).expect("V2 empty fixture 必须可加载");
+    assert_eq!(parsed.context_window_tokens, 200_000);
+    assert_eq!(parsed.compact_threshold_percent, 70);
+    assert!(parsed.approved_mcp.servers.is_empty());
+
+    let http = materialize_fixture_source_v2("runtime_config_v2_http_mcp.toml");
+    let parsed = load_runtime_config_v2_from_str(&http).expect("V2 HTTP fixture 必须可加载");
+    assert_eq!(parsed.expected_tools.iter().next().unwrap(), "demo__search");
+    assert_eq!(parsed.approved_mcp.servers.len(), 1);
+}
+
+/// V2 上下文窗口与压缩百分比必须走上下界校验：零、超界和超上限都拒绝。
+///
+/// 非法值在 renderer 校验阶段就被拒绝，因此负测先渲染合法文本再逐字段篡改，
+/// 并独立重算 revision，保证断言命中字段校验而不是摘要失败。
+#[test]
+fn runtime_config_v2_rejects_out_of_bounds_compact_fields() {
+    let base = runtime_config_v2_fixture();
+    let rendered = render_runtime_config_v2(&base).expect("基准配置必须可渲染");
+
+    for (needle, replacement, expected) in [
+        (
+            "context_window_tokens = 200000",
+            "context_window_tokens = 0",
+            "context_window_tokens",
+        ),
+        (
+            "context_window_tokens = 200000",
+            "context_window_tokens = 100000001",
+            "context_window_tokens",
+        ),
+        (
+            "compact_threshold_percent = 70",
+            "compact_threshold_percent = 0",
+            "compact_threshold_percent",
+        ),
+        (
+            "compact_threshold_percent = 70",
+            "compact_threshold_percent = 101",
+            "compact_threshold_percent",
+        ),
+    ] {
+        let tampered = rendered.replacen(needle, replacement, 1);
+        let tampered = with_independent_revision_v2(&tampered);
+        assert_loader_error_v2(&tampered, expected);
+    }
+
+    // renderer 自身也必须 fail-closed：越界值不能等到 loader 才被发现。
+    let mut zero_window = base.clone();
+    zero_window.context_window_tokens = 0;
+    let error =
+        render_runtime_config_v2(&zero_window).expect_err("context_window_tokens 为零必须拒绝渲染");
+    assert!(format!("{error:#}").contains("context_window_tokens"));
+
+    // 边界值本身必须可接受：上限值与 1/100 都属于合法输入。
+    let mut edge = base.clone();
+    edge.context_window_tokens = 100_000_000;
+    edge.compact_threshold_percent = 100;
+    let rendered = render_runtime_config_v2(&edge).expect("边界 V2 配置必须可渲染");
+    let parsed = load_runtime_config_v2_from_str(&rendered).expect("边界 V2 配置必须可通过 loader");
+    assert_eq!(parsed.context_window_tokens, 100_000_000);
+    assert_eq!(parsed.compact_threshold_percent, 100);
+
+    let mut low_percent = base;
+    low_percent.context_window_tokens = 1;
+    low_percent.compact_threshold_percent = 1;
+    let rendered = render_runtime_config_v2(&low_percent).expect("最小边界 V2 配置必须可渲染");
+    let parsed =
+        load_runtime_config_v2_from_str(&rendered).expect("最小边界 V2 配置必须可通过 loader");
+    assert_eq!(parsed.context_window_tokens, 1);
+    assert_eq!(parsed.compact_threshold_percent, 1);
+}
+
+/// V2 也要拒绝未知字段，避免运行期 wire 扩张破坏闭集。
+#[test]
+fn runtime_config_v2_rejects_unknown_fields() {
+    let rendered =
+        render_runtime_config_v2(&runtime_config_v2_fixture()).expect("基准 V2 配置必须可渲染");
+    for injected in [
+        rendered.replacen(
+            "context_window_tokens",
+            "unknown_compact = true\ncontext_window_tokens",
+            1,
+        ),
+        rendered.replacen("[model]\n", "[model]\nunknown_model = true\n", 1),
+        rendered.replacen(
+            "[approved_mcp]\nservers = {}",
+            "[approved_mcp]\nservers = {}\nunknown_approved = true",
+            1,
+        ),
+    ] {
+        assert_loader_error_v2(&injected, "runtime_config_invalid");
+    }
+}
+
+/// V1/V2 混合：同一文件名的 V1 内容走 V1 loader，同名 V2 内容走 V2 loader；枚举暴露统一视图。
+#[test]
+fn runtime_config_mixed_versions_share_one_view() {
+    let v1_config: RuntimeConfigV1 = {
+        let source = materialize_fixture_source("runtime_config_v1_empty.toml");
+        load_runtime_config_v1_from_str(&source).expect("V1 fixture 必须可加载")
+    };
+    let v2_rendered =
+        render_runtime_config_v2(&runtime_config_v2_fixture()).expect("V2 fixture 必须可渲染");
+    let v2_config = load_runtime_config_v2_from_str(&v2_rendered).expect("V2 fixture 必须可加载");
+
+    let v1_view = RuntimeConfig::V1(v1_config.clone());
+    let v2_view = RuntimeConfig::V2(v2_config.clone());
+    assert_eq!(v1_view.context_window_tokens(), 200_000);
+    assert_eq!(v1_view.compact_threshold_percent(), 70);
+    assert_eq!(v2_view.context_window_tokens(), 200_000);
+    assert_eq!(v2_view.compact_threshold_percent(), 70);
+    assert_eq!(v1_view.session_cwd(), v1_config.session_cwd);
+    assert_eq!(v2_view.session_cwd(), v2_config.session_cwd);
+    assert_eq!(v1_view.model().base_url, v2_view.model().base_url);
+}
+
+/// V2 的 session_cwd 与共享模型约束必须与 V1 完全一致。
+#[test]
+fn runtime_config_v2_keeps_shared_path_and_model_contract() {
+    let base = runtime_config_v2_fixture();
+
+    let mut relative_cwd = base.clone();
+    relative_cwd.session_cwd = "relative/path".to_owned();
+    let error = render_runtime_config_v2(&relative_cwd).expect_err("相对 session_cwd 必须拒绝渲染");
+    assert!(format!("{error:#}").contains("session_cwd"));
+
+    let mut escaped_cwd = base.clone();
+    escaped_cwd.session_cwd = "/safe/../session".to_owned();
+    let error = render_runtime_config_v2(&escaped_cwd).expect_err("带 .. 的路径必须拒绝渲染");
+    assert!(format!("{error:#}").contains("session_cwd"));
+
+    let mut upstream_url = base.clone();
+    upstream_url.model.base_url = "http://localhost:4312/v1".to_owned();
+    let error = render_runtime_config_v2(&upstream_url).expect_err("非回环 URL 必须拒绝渲染");
+    assert!(format!("{error:#}").contains("model.base_url"));
+
+    let mut wrong_backend = base.clone();
+    wrong_backend.model.backend = "responses".to_owned();
+    let error = render_runtime_config_v2(&wrong_backend).expect_err("非 chat_completions 必须拒绝");
+    assert!(format!("{error:#}").contains("model.backend"));
+
+    let tampered = render_runtime_config_v2(&base)
+        .expect("基准 V2 必须可渲染")
+        .replacen("schema_version = 2", "schema_version = 1", 1);
+    assert_loader_error_v2(&tampered, "schema_version");
+}
+
+/// Host 新写的 V2 文件与 V1 文件路径并列时，路径校验仍拒绝目录逃逸与未知版本名。
+#[test]
+fn runtime_config_v2_from_path_round_trip_and_escape_rejection() {
+    let (dir, path) = write_config_v2(&runtime_config_v2_fixture());
+    let loaded = load_runtime_config_v2(&path).expect("V2 文件必须可从路径加载");
+    assert_eq!(loaded.schema_version, 2);
+
+    let escaped = dir.path().join("../runtime-config.v2.toml");
+    let error = load_runtime_config_v2(&escaped).expect_err("目录逃逸的 V2 路径必须拒绝读取");
+    assert!(format!("{error:#}").contains("读取 RuntimeConfigV2 TOML 失败"));
 }

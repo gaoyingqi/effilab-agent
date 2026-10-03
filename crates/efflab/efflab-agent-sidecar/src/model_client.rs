@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use efflab_agent_contract::{LoopbackModelSpec, RuntimeConfigV1, is_literal_loopback_http_url};
+use efflab_agent_contract::{LoopbackModelSpec, RuntimeConfig, is_literal_loopback_http_url};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -151,10 +151,7 @@ impl ModelTurnRequest {
         object.insert("model".to_owned(), Value::String(model_id.to_owned()));
         object.insert("stream".to_owned(), Value::Bool(true));
         // OpenAI 兼容契约：流式 usage 只在显式索取时返回，缺失则上游不发尾帧。
-        object.insert(
-            "stream_options".to_owned(),
-            json!({"include_usage": true}),
-        );
+        object.insert("stream_options".to_owned(), json!({"include_usage": true}));
         object.insert("messages".to_owned(), Value::Array(self.messages.clone()));
 
         if let Some(tools) = &self.tools
@@ -329,9 +326,9 @@ enum BindingSource {
 }
 
 impl HttpModelClient {
-    /// 从 `RuntimeConfigV1.model` 构造 client，不接受 ACP 元数据中的模型覆盖。
-    pub fn from_runtime_config(config: &RuntimeConfigV1) -> Result<Self, ModelError> {
-        Self::from_model(&config.model)
+    /// 从版本化 runtime config 的 `model` 构造 client，不接受 ACP 元数据中的模型覆盖。
+    pub fn from_runtime_config(config: &RuntimeConfig) -> Result<Self, ModelError> {
+        Self::from_model(config.model())
     }
 
     /// 从已校验的 loopback 模型规格构造生产 client；生产调用只能经由 runtime config。

@@ -14,10 +14,14 @@ pub use host_contract::{
     validate_host_request, validate_prompt_text,
 };
 pub use mcp_config::{ApprovedMcpConfig, McpServerSpec, is_qualified_tool_name, is_server_name};
-pub use model::{LoopbackModelSpec, RuntimeConfigV1, SidecarModelSpec};
+pub use model::{
+    DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_CONTEXT_WINDOW_TOKENS, LoopbackModelSpec,
+    RUNTIME_SCHEMA_VERSION_V2, RuntimeConfig, RuntimeConfigV1, RuntimeConfigV2, SidecarModelSpec,
+};
 pub use render::{
-    is_literal_loopback_http_url, load_runtime_config_v1, load_runtime_config_v1_from_str,
-    render_authoritative_config, render_runtime_config_v1, validate_authoritative_config,
-    validate_session_cwd,
+    RUNTIME_CONFIG_V1_FILENAME, RUNTIME_CONFIG_V2_FILENAME, is_literal_loopback_http_url,
+    load_runtime_config_v1, load_runtime_config_v1_from_str, load_runtime_config_v2,
+    load_runtime_config_v2_from_str, render_authoritative_config, render_runtime_config_v1,
+    render_runtime_config_v2, validate_authoritative_config, validate_session_cwd,
 };
 pub use stdio_mcp::deny_stdio_mcp;

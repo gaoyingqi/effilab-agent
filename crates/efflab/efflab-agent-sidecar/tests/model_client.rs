@@ -100,10 +100,7 @@ async fn streams_split_sse_deltas_with_binding_token_without_retry() {
     assert_eq!(received["stream"], Value::Bool(true));
     assert_eq!(received["model"], "byok-user-model");
     // 显式索取流式 usage，否则上游有权不发送 usage 尾帧。
-    assert_eq!(
-        received["stream_options"],
-        json!({"include_usage": true})
-    );
+    assert_eq!(received["stream_options"], json!({"include_usage": true}));
     let keys = received
         .as_object()
         .expect("请求 JSON object")
@@ -144,10 +141,7 @@ async fn sends_only_closed_chat_completion_keys_with_tools() {
     );
 
     let received = server.received_json();
-    assert_eq!(
-        received["stream_options"],
-        json!({"include_usage": true})
-    );
+    assert_eq!(received["stream_options"], json!({"include_usage": true}));
     let keys = received
         .as_object()
         .expect("请求 JSON object")

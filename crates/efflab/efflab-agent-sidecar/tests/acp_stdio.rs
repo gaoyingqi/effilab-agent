@@ -771,10 +771,7 @@ mod task13 {
 
     /// 把并行 tool call 编成 Chat Completions SSE 可用的 JSON 数组。
     /// 每个 function call 的 id 全局递增，保证跨 prompt 的 ACP toolCallId 不碰撞。
-    fn encode_scripted_tool_calls(
-        calls: &[(String, String)],
-        next_call_id: &AtomicU64,
-    ) -> String {
+    fn encode_scripted_tool_calls(calls: &[(String, String)], next_call_id: &AtomicU64) -> String {
         let encoded = calls
             .iter()
             .enumerate()
@@ -1932,6 +1929,200 @@ mod task13 {
         );
         assert_jsonrpc_lines(&client.raw_lines);
         process.finish_raw(&mut client, "usage tail notification");
+    }
+
+    /// 回合收敛后必须经 `_x.ai/context_usage` 上报一次会话级占用估算；
+    /// 载荷只含估算数字，journal 与 session/update 流都不得混入该信号。
+    #[test]
+    fn turn_completion_reports_context_usage_notification() {
+        let model = ScriptedL3b::new([ScriptedResponse::text_with_usage(
+            "context answer",
+            291,
+            32,
+            323,
+        )]);
+        let fixture = Fixture::with_model_url(model.base_url().to_owned());
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "usage please" }]),
+                Some(json!({ "promptId": "prompt-context-usage" })),
+            ),
+        );
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+
+        // 占用上报是 detached 尽力信号：通知可能在 response 之前或之后到达。
+        // 先扫已收 raw_lines，未到时再逐条读取，避免与 response 竞态。
+        loop {
+            if client
+                .raw_lines
+                .iter()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|value| value["method"] == "_x.ai/context_usage")
+            {
+                break;
+            }
+            client.read_message();
+        }
+
+        let values = client
+            .raw_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        let usage_notifications = values
+            .iter()
+            .filter(|value| value["method"] == "_x.ai/context_usage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            usage_notifications.len(),
+            1,
+            "回合收敛后必须产生恰好一次 context_usage 通知: {values:?}"
+        );
+        let params = &usage_notifications[0]["params"];
+        assert_eq!(params["sessionId"], json!(session));
+        assert!(
+            params
+                .get("_meta")
+                .and_then(|meta| meta.get("isReplay"))
+                .is_none(),
+            "live 占用估算不得携带 isReplay 标记: {params:?}"
+        );
+        let used = params["usedTokensEstimate"]
+            .as_u64()
+            .expect("usedTokensEstimate 必须是非负整数");
+        let window = params["contextWindowTokens"]
+            .as_u64()
+            .expect("contextWindowTokens 必须是非负整数");
+        let percent = params["percentEstimate"]
+            .as_u64()
+            .expect("percentEstimate 必须是非负整数");
+        assert!(
+            params["measuredAtMs"].as_u64().is_some(),
+            "measuredAtMs 必须是非负整数: {params:?}"
+        );
+        assert!(used > 0, "非空会话的占用估算必须大于零: {params:?}");
+        assert_eq!(window, 200_000, "默认 runtime 窗口必须来自已验证配置");
+        assert_eq!(
+            percent,
+            used.saturating_mul(100) / window,
+            "percent 必须与 used/window 一致: {params:?}"
+        );
+        // 占用估算不携带 promptId，也不是 session/update 产品事件。
+        assert!(
+            params.get("promptId").is_none(),
+            "占用估算不得关联具体回合: {params:?}"
+        );
+        assert!(
+            values.iter().all(|value| {
+                value["method"] != "session/update"
+                    || value["params"]["update"]["sessionUpdate"] != "context_usage"
+            }),
+            "context_usage 不得混入 session/update 流: {values:?}"
+        );
+
+        // journal 只保存会话记录；占用估算是 live 信号，不落盘。
+        let records_path = fixture
+            .home
+            .join("efflab-sessions")
+            .join("v1")
+            .join(&session)
+            .join("records.jsonl");
+        let records = fs::read_to_string(records_path).expect("prompt journal 必须存在");
+        assert!(
+            !records.contains("context_usage") && !records.contains("usedTokensEstimate"),
+            "journal 不得含占用估算字段: {records}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+        process.finish_raw(&mut client, "context usage notification");
+    }
+
+    /// journal replay 不得重放占用快照：session/load 的 replay 通知流内不应出现
+    /// 带 `_meta.isReplay` 的 `_x.ai/context_usage`；会话激活后必须补发一条新的
+    /// live 估算（不带 isReplay），供 Host 恢复点重算占用。
+    #[test]
+    fn session_load_replay_does_not_replay_context_usage() {
+        let model = ScriptedL3b::new([ScriptedResponse::text("first answer")]);
+        let fixture = Fixture::with_model_url(model.base_url().to_owned());
+        let (mut process, mut client) = fixture.spawn_raw();
+        let _ = client.request("initialize", initialize_params());
+        let session = session_id(&client.request(
+            "session/new",
+            json!({ "cwd": fixture.session_cwd, "mcpServers": [] }),
+        ));
+        let prompt_rpc_id = client.send_request(
+            "session/prompt",
+            prompt_params(
+                &session,
+                json!([{ "type": "text", "text": "hello" }]),
+                Some(json!({ "promptId": "prompt-before-load" })),
+            ),
+        );
+        let response = client.read_response(prompt_rpc_id);
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        // turn 结束时的 live 快照已发出；随后 session/load 的 replay 流不得重放它。
+        let lines_before_load = client.raw_lines.len();
+
+        let load_id = client.send_request(
+            "session/load",
+            json!({
+                "sessionId": session,
+                "cwd": fixture.session_cwd,
+                "mcpServers": []
+            }),
+        );
+        let load_response = client.read_response(load_id);
+        assert!(load_response["result"].is_object());
+
+        // replay 区间内的通知要么带 isReplay（历史帧），要么是新估算的 live
+        // 快照；带 isReplay 的 context_usage 绝不允许出现。
+        let replay_lines = &client.raw_lines[lines_before_load..];
+        let replay_values = replay_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            replay_values.iter().all(|value| {
+                value["method"] != "_x.ai/context_usage"
+                    || value["params"]["_meta"]["isReplay"] != Value::Bool(true)
+            }),
+            "session/load replay 不得重放 context_usage: {replay_values:?}"
+        );
+
+        // 恢复完成后必须补发一条新的 live 估算（无 isReplay 标记）；detached
+        // 上报可能在 load response 之前或之后到达。先扫 load 区间已收行，
+        // 未到时再逐条读取，避免与 response 竞态。
+        let mut live_usage = replay_values
+            .iter()
+            .find(|value| {
+                value["method"] == "_x.ai/context_usage"
+                    && value["params"]["_meta"]["isReplay"] != Value::Bool(true)
+            })
+            .cloned();
+        while live_usage.is_none() {
+            let value = client.read_message();
+            if value["method"] == "_x.ai/context_usage"
+                && value["params"]["_meta"]["isReplay"] != Value::Bool(true)
+            {
+                live_usage = Some(value);
+            }
+        }
+        let usage_params = &live_usage.expect("必须收到 live 占用估算")["params"];
+        assert_eq!(usage_params["sessionId"], json!(session));
+        assert!(
+            usage_params["usedTokensEstimate"].as_u64().is_some(),
+            "重连估算必须是合法的占用载荷: {usage_params:?}"
+        );
+        assert_jsonrpc_lines(&client.raw_lines);
+        process.finish_raw(&mut client, "replay excludes context usage");
     }
 
     /// session/load 回放必须从 journal 还原 display 到 ToolCallUpdate.raw_output，
@@ -3352,11 +3543,7 @@ mod task13 {
         );
         let response = client.read_response(prompt_rpc_id);
         assert_eq!(response["result"]["stopReason"], "refusal");
-        assert_eq!(
-            server.model_call_count(),
-            1,
-            "拒绝后不得发起第二次模型调用"
-        );
+        assert_eq!(server.model_call_count(), 1, "拒绝后不得发起第二次模型调用");
         assert_eq!(
             execution_count(seam),
             0,
@@ -3423,13 +3610,16 @@ mod task13 {
             );
             let response = client.read_response(prompt_rpc_id);
             assert_eq!(
-                response["result"]["stopReason"],
-                "end_turn",
+                response["result"]["stopReason"], "end_turn",
                 "压缩不得把 prompt 打成错误: {prompt_id} {response}"
             );
         }
         server.wait_for_requests(4);
-        assert_eq!(server.model_call_count(), 4, "第三次 prompt 应先 compact 再回答");
+        assert_eq!(
+            server.model_call_count(),
+            4,
+            "第三次 prompt 应先 compact 再回答"
+        );
         let bodies = server.request_bodies();
         let compact_users = user_message_contents(&bodies[2]);
         assert!(
@@ -3439,7 +3629,9 @@ mod task13 {
             "第三次 prompt 的第一次模型调用必须是压缩请求: {compact_users:?}"
         );
         assert!(
-            compact_users.iter().any(|text| text.contains("compact-alpha")),
+            compact_users
+                .iter()
+                .any(|text| text.contains("compact-alpha")),
             "压缩请求必须看得到被摘要的旧回合: {compact_users:?}"
         );
         let turn_users = user_message_contents(&bodies[3]);

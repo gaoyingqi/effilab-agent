@@ -5,7 +5,7 @@
 ## 定位与边界
 
 - **最小 runtime**：由 `sidecar_config`、`hardening`、`runtime`、`acp_agent`、`session_store`、`model_client` 和 `turn_loop` 组成。
-- **启动输入**：Host 通过 `--runtime-config` 指定 `RuntimeConfigV1`，通过 `--home` 指定隔离私有 home，通过 `--session-cwd` 指定隔离会话目录。runtime config 必须位于 `<home>/runtime-config.v1.toml`，不会回退或读取旧 `config.toml`。
+- **启动输入**：Host 通过 `--runtime-config` 指定版本化 `RuntimeConfig`（M5 起为 V2），通过 `--home` 指定隔离私有 home，通过 `--session-cwd` 指定隔离会话目录。runtime config 必须位于 `<home>/runtime-config.v2.toml`（M5 之前写出的 `<home>/runtime-config.v1.toml` 仍被接受），不会回退或读取旧 `config.toml`。
 - **ACP stdio**：当前只支持 `--stdio`。stdout 仅输出 ACP JSON-RPC，日志固定写 stderr；stdout 由 ACP transport 单写者负责。
 - **模型边界**：`model_client` 只连接 runtime config 校验后的 loopback L3b Chat Completions endpoint；取消、请求大小、SSE 行和总响应大小均有界，binding 不进入日志、journal 或 ACP 错误。
 - **工具边界**：当前唯一可执行工具是经 permission 后运行的无副作用 `GrokBuild:efflab_noop`。不启动 stdio MCP 子进程，不读取 MCP command/env，也不把未审核工具传给模型。
@@ -23,14 +23,14 @@ cargo build -p efflab-agent-sidecar --release
 ```bash
 efflab-agent-sidecar \
   --stdio \
-  --runtime-config <home>/runtime-config.v1.toml \
+  --runtime-config <home>/runtime-config.v2.toml \
   --home <private-home> \
   --session-cwd <session-cwd>
 ```
 
 参数说明：
 
-- `--runtime-config`：Host 生成的 `RuntimeConfigV1` 文件；必须是 `<home>/runtime-config.v1.toml`。
+- `--runtime-config`：Host 生成的版本化 runtime 配置文件；必须是 `<home>/runtime-config.v1.toml` 或 `<home>/runtime-config.v2.toml`，并按文件名分派到对应版本 loader。
 - `--home`：sidecar 的隔离私有 home；用于 home lock、v1 session journal 和 runtime config。
 - `--session-cwd`：Host 创建并校验的隔离会话目录。
 - `--stdio`：ACP stdio 传输开关；当前关闭时启动会被拒绝。
@@ -47,7 +47,7 @@ prompt 采用有限流程：先建立 session admission，再原子追加 user r
 
 | 模块 | 职责 |
 |---|---|
-| `sidecar_config.rs` | CLI、路径和 `RuntimeConfigV1` 白名单校验 |
+| `sidecar_config.rs` | CLI、路径和版本化 runtime 配置白名单校验（V1/V2 文件名分派） |
 | `hardening.rs` | Unix 私有目录、owner-only 权限、home lock、环境 allowlist |
 | `runtime.rs` | current-thread Tokio、stdin bridge、ACP connection、EOF drain |
 | `acp_agent.rs` | ACP session/prompt admission、cancel latch、permission gateway、replay |
