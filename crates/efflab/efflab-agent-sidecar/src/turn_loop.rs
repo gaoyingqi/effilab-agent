@@ -317,9 +317,7 @@ impl TurnLoop {
             .await
         {
             CompactOutcome::Cancelled => {
-                return self
-                    .finish_cancelled(session_id, prompt_id, &control)
-                    .await;
+                return self.finish_cancelled(session_id, prompt_id, &control).await;
             }
             CompactOutcome::Applied | CompactOutcome::Skipped => {}
         }
@@ -330,9 +328,7 @@ impl TurnLoop {
 
         loop {
             if cancellation.is_cancelled() {
-                return self
-                    .finish_cancelled(session_id, prompt_id, &control)
-                    .await;
+                return self.finish_cancelled(session_id, prompt_id, &control).await;
             }
 
             // 每次循环只发起一次不可重试的模型调用；工具续回合由显式上限控制。
@@ -345,9 +341,7 @@ impl TurnLoop {
             let mut stream = match self.model.stream_turn(request, cancellation.clone()).await {
                 Ok(stream) => stream,
                 Err(ModelError::Cancelled) if cancellation.is_cancelled() => {
-                    return self
-                        .finish_cancelled(session_id, prompt_id, &control)
-                        .await;
+                    return self.finish_cancelled(session_id, prompt_id, &control).await;
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -357,12 +351,7 @@ impl TurnLoop {
                         "Model turn request failed"
                     );
                     return self
-                        .finish_failed(
-                            session_id,
-                            prompt_id,
-                            &control,
-                            TurnLoopError::Model,
-                        )
+                        .finish_failed(session_id, prompt_id, &control, TurnLoopError::Model)
                         .await;
                 }
             };
@@ -410,12 +399,7 @@ impl TurnLoop {
                             .await
                         {
                             return self
-                                .finish_failed(
-                                    session_id,
-                                    prompt_id,
-                                    &control,
-                                    error,
-                                )
+                                .finish_failed(session_id, prompt_id, &control, error)
                                 .await;
                         }
                     }
@@ -435,12 +419,7 @@ impl TurnLoop {
                             self.send_thought_delta(session_id, prompt_id, &delta).await
                         {
                             return self
-                                .finish_failed(
-                                    session_id,
-                                    prompt_id,
-                                    &control,
-                                    error,
-                                )
+                                .finish_failed(session_id, prompt_id, &control, error)
                                 .await;
                         }
                     }
@@ -457,9 +436,7 @@ impl TurnLoop {
                         break;
                     }
                     Err(ModelError::Cancelled) if cancellation.is_cancelled() => {
-                        return self
-                            .finish_cancelled(session_id, prompt_id, &control)
-                            .await;
+                        return self.finish_cancelled(session_id, prompt_id, &control).await;
                     }
                     Err(error) => {
                         tracing::debug!(
@@ -469,12 +446,7 @@ impl TurnLoop {
                             "Model SSE stream failed"
                         );
                         return self
-                            .finish_failed(
-                                session_id,
-                                prompt_id,
-                                &control,
-                                TurnLoopError::Model,
-                            )
+                            .finish_failed(session_id, prompt_id, &control, TurnLoopError::Model)
                             .await;
                     }
                 }
@@ -487,12 +459,7 @@ impl TurnLoop {
                     test_seam.wait_if_enabled("after_model_done").await;
                 }
                 return self
-                    .finish_completed(
-                        session_id,
-                        prompt_id,
-                        &control,
-                        &assistant_text,
-                    )
+                    .finish_completed(session_id, prompt_id, &control, &assistant_text)
                     .await;
             }
             if tool_rounds >= MAX_TOOL_ROUNDS {
@@ -535,29 +502,17 @@ impl TurnLoop {
                     thought_text.clear();
                 }
                 Ok(ToolRoundResult::Cancelled) => {
-                    return self
-                        .finish_cancelled(session_id, prompt_id, &control)
-                        .await;
+                    return self.finish_cancelled(session_id, prompt_id, &control).await;
                 }
                 Ok(ToolRoundResult::Refused) => {
                     return self
-                        .finish_terminal(
-                            session_id,
-                            prompt_id,
-                            &control,
-                            TerminalKind::Refused,
-                        )
+                        .finish_terminal(session_id, prompt_id, &control, TerminalKind::Refused)
                         .await
                         .map(|(response, _)| response);
                 }
                 Err(error) => {
                     return self
-                        .finish_failed(
-                            session_id,
-                            prompt_id,
-                            &control,
-                            error,
-                        )
+                        .finish_failed(session_id, prompt_id, &control, error)
                         .await;
                 }
             }
@@ -799,12 +754,8 @@ impl TurnLoop {
             return CompactOutcome::Skipped;
         }
 
-        let record = SessionRecord::compact_summary(
-            UNASSIGNED_SEQUENCE,
-            prompt_id,
-            covered_until,
-            summary,
-        );
+        let record =
+            SessionRecord::compact_summary(UNASSIGNED_SEQUENCE, prompt_id, covered_until, summary);
         if let Err(error) = self
             .repository
             .append(session_id, std::slice::from_ref(&record))
@@ -832,7 +783,10 @@ impl TurnLoop {
                 records.push(record);
             }
         }
-        tracing::debug!(event = "turn_compact_applied", "上下文压缩摘要已写入 journal");
+        tracing::debug!(
+            event = "turn_compact_applied",
+            "上下文压缩摘要已写入 journal"
+        );
         CompactOutcome::Applied
     }
 
@@ -2389,11 +2343,23 @@ mod tests {
     fn transcript_recovery_applies_latest_compact_summary() {
         let records = vec![
             SessionRecord::user(0, "prompt-a", "old user"),
-            SessionRecord::assistant_snapshot(1, "prompt-a", "assistant-text", "old assistant", false),
+            SessionRecord::assistant_snapshot(
+                1,
+                "prompt-a",
+                "assistant-text",
+                "old assistant",
+                false,
+            ),
             SessionRecord::turn_terminal(2, "prompt-a", "completed"),
             SessionRecord::compact_summary(3, "prompt-b", 2, "kept facts"),
             SessionRecord::user(4, "prompt-b", "new user"),
-            SessionRecord::assistant_snapshot(5, "prompt-b", "assistant-text", "new assistant", false),
+            SessionRecord::assistant_snapshot(
+                5,
+                "prompt-b",
+                "assistant-text",
+                "new assistant",
+                false,
+            ),
         ];
         let messages = transcript_messages(&records, "system");
         assert_eq!(messages[0]["content"], "system");
