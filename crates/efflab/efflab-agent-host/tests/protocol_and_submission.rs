@@ -2,7 +2,6 @@
 //!
 //! 本文件先于 host crate 实现创建，以锁定 M0 协议形状和最小 dispatch 行为。
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

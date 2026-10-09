@@ -3,23 +3,33 @@
 //! 本文件先于实现创建，锁定 Task 5 的 fail-closed 边界；不启动产品 sidecar。
 //! Task19 的真实启动链只使用受控 fake 进程，不连接外部服务。
 
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+// Task19 的真实启动链测试只存在于 unix；这些 import 若在 Windows 可见会报 unused。
+#[cfg(unix)]
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::process::Command;
 
 #[cfg(unix)]
 use serde_json::Value;
 
 use efflab_agent_host::{
-    ApprovedMcpConfig, ApprovedMcpSpec, ChildEnvironment, ChildLifecycle, ChildLifecycleOps,
-    HostApp, HostRuntime, HostRuntimeConfig, KitCommand, KitReply, LlmChannelConfig,
-    LlmChannelService, McpServerSpec, ProcessSlotState, ScopeId, SealedSecret, SecretGuard,
+    ChildEnvironment, ChildLifecycle, ChildLifecycleOps, HostRuntimeConfig, ProcessSlotState,
     Supervisor, SupervisorError,
+};
+#[cfg(unix)]
+use efflab_agent_host::{
+    ApprovedMcpConfig, ApprovedMcpSpec, HostApp, HostRuntime, KitCommand, KitReply,
+    LlmChannelConfig, LlmChannelService, McpServerSpec, ScopeId, SealedSecret, SecretGuard,
 };
 
 #[cfg(unix)]

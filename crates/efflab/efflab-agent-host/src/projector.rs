@@ -258,7 +258,8 @@ impl Projector {
     }
 
     /// 仅供 Host runtime 单元测试构造 sequence 耗尽边界；生产代码没有回退入口。
-    #[cfg(test)]
+    /// 唯一调用方是 unix-only 的 terminal sequence 测试（依赖 UnixStream），故同步收窄门。
+    #[cfg(all(test, unix))]
     pub(crate) fn set_next_sequence_for_test(&mut self, session_id: &str, next_sequence: u64) {
         self.sessions
             .entry(session_id.to_string())

@@ -179,7 +179,8 @@ pub(crate) struct SubmissionMap {
 #[derive(Debug, Clone)]
 pub(crate) enum SubmissionDecision {
     /// 首次看到该 key 和指纹；ticket 会随 actor 生命周期共享。
-    Accepted { turn_id: String, ticket: SendTicket },
+    /// turn_id 恒等于 submission_id（M0 协议），调用方按 key 推导，不在此重复携带。
+    Accepted { ticket: SendTicket },
     /// 该 key 命中同一稳定指纹。
     Duplicate { turn_id: String },
     /// 该 key 已存在但稳定指纹不同。
@@ -251,7 +252,7 @@ impl SubmissionMap {
                 ticket: ticket.clone(),
             },
         );
-        SubmissionDecision::Accepted { turn_id, ticket }
+        SubmissionDecision::Accepted { ticket }
     }
 }
 

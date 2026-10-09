@@ -1375,6 +1375,7 @@ fn prepare_scope_directories(paths: &ScopePaths) -> Result<(), SupervisorError> 
 /// 该检查只使用标准库元数据与单级 `create_dir`，因此不依赖某一平台的 no-follow API。
 /// 检查和后续打开之间仍存在无法由当前抽象消除的 TOCTOU 窗口，调用方必须继续采用
 /// fail-closed 和同目录原子替换策略。
+#[cfg(not(windows))]
 fn ensure_host_owned_directory(path: &Path) -> io::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -1399,6 +1400,7 @@ fn ensure_host_owned_directory(path: &Path) -> io::Result<()> {
 }
 
 /// 目录链中的每一级都必须是普通目录；符号链接和普通文件一律拒绝。
+#[cfg(not(windows))]
 fn ensure_plain_directory(metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(io::Error::other("Host 目录链必须由普通目录组成"));
@@ -1407,6 +1409,7 @@ fn ensure_plain_directory(metadata: &fs::Metadata) -> io::Result<()> {
 }
 
 /// 收紧 Host 新建/管理目录的 Unix 权限；Windows capability 未启用时不依赖此 API。
+#[cfg(not(windows))]
 fn set_private_directory_mode(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

@@ -657,6 +657,10 @@ pub(crate) fn embedded_ipv4_address(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 }
 
 /// 仅允许公网地址；显式开关只放行 loopback，绝不放行其它 private/link-local/metadata。
+///
+/// 当前上游 SSRF 策略有意只在 BYOK 保存路径做 URL 形状校验（不再做 IP 分类），
+/// 该分类器仅由本文件单测锁定行为；保留实现以备将来重新接入出站验证。
+#[cfg(test)]
 pub(crate) fn is_allowed_upstream_ip(ip: IpAddr, allow_loopback_llm: bool) -> bool {
     match ip {
         IpAddr::V4(ip) => {

@@ -16,7 +16,7 @@ use crate::app_port::{
     ApprovedMcpSpecV1, HostApp, LlmChannelConfig, LlmSecretSlot, ScopeId, SealedSecret, SecretGuard,
 };
 use crate::config::{HostRuntimeConfig, L3bRuntimeConfig};
-use crate::llm_loopback::{L3bLoopback, embedded_ipv4_address};
+use crate::llm_loopback::L3bLoopback;
 use crate::protocol::{KitError, LlmChannelKind, LlmChannelView};
 use crate::supervisor::{
     ScopePaths, SidecarProcessInfo, SidecarStdio, Supervisor, SupervisorError,
@@ -788,17 +788,6 @@ fn validate_byok_candidate_addresses_with_resolver(
         return Err(LlmChannelError::InvalidRequest);
     };
     validate_byok_identity_shape(base_url, model_id, allow_loopback_llm)
-}
-
-/// 判断原生或 IPv4-embedded 地址是否等价于回环，用于严格的开发 HTTP 例外。
-pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(address) => address.is_loopback(),
-        IpAddr::V6(address) => {
-            address.is_loopback()
-                || embedded_ipv4_address(address).is_some_and(|embedded| embedded.is_loopback())
-        }
-    }
 }
 
 /// 由持久化配置生成设置页 view；密封载体存在不代表已经解封。
