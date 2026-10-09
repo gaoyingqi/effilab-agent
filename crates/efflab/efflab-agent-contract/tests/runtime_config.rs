@@ -66,12 +66,30 @@ fn session_cwd_string() -> String {
         .to_owned()
 }
 
-/// 用 TOML 编码写入 cwd，确保 Windows 反斜杠不会破坏 basic string。
+/// 先统一 fixture 行尾，再用 TOML 编码 cwd，避免字面量改写失效或反斜杠破坏字符串。
 fn materialize_cwd(source: &str) -> String {
-    source.replace(
+    source.replace("\r\n", "\n").replace(
         "session_cwd = \"<canonical-session-cwd>\"",
         &session_cwd_assignment(),
     )
+}
+
+/// 合成 CRLF 输入，确保 fixture 改写不依赖 Git 检出的行尾。
+#[test]
+fn runtime_config_fixture_materialization_normalizes_crlf() {
+    for name in [
+        "runtime_config_v1_empty.toml",
+        "runtime_config_v1_http_mcp.toml",
+        "runtime_config_v1_expected_tools_under_servers.toml",
+        "runtime_config_v2_empty.toml",
+        "runtime_config_v2_http_mcp.toml",
+    ] {
+        let lf = fixture_source(name).replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        let source = materialize_cwd(&crlf);
+        assert_eq!(source, materialize_cwd(&lf), "fixture 行尾应归一: {name}");
+        assert!(source.contains("[model]\n"));
+    }
 }
 
 fn session_cwd_assignment() -> String {
@@ -193,7 +211,10 @@ fn runtime_config_v1_can_validate_already_read_source() {
 
 #[test]
 fn runtime_config_session_cwd_uses_one_absolute_utf8_lexical_contract() {
-    let exact_limit = format!("/{}", "x".repeat(4095));
+    // Windows 绝对路径需盘符，边界长度按 UTF-8 字节计算。
+    let root = if cfg!(windows) { "C:\\" } else { "/" };
+    let exact_limit = format!("{root}{}", "x".repeat(4096 - root.len()));
+    assert_eq!(exact_limit.len(), 4096);
     let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
         &session_cwd_assignment(),
         &format!("session_cwd = {}", toml::Value::String(exact_limit.clone())),
@@ -205,10 +226,12 @@ fn runtime_config_session_cwd_uses_one_absolute_utf8_lexical_contract() {
         "4096 字节绝对 UTF-8 session_cwd 应通过 shape 校验"
     );
 
+    let escaped = session_cwd().join("..").join("session");
+    let nul = format!("{}\0session", session_cwd_string());
     for (invalid, expected) in [
         ("relative/session", "绝对"),
-        ("/safe/../session", ".."),
-        ("/safe\0session", "NUL"),
+        (escaped.to_str().expect("测试路径必须为 UTF-8"), ".."),
+        (nul.as_str(), "NUL"),
     ] {
         let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
             &session_cwd_assignment(),
@@ -228,15 +251,18 @@ fn runtime_config_session_cwd_uses_one_absolute_utf8_lexical_contract() {
         );
     }
 
-    let oversized = format!("/{}", "x".repeat(4096));
+    let oversized = format!("{root}{}", "x".repeat(4097 - root.len()));
+    assert_eq!(oversized.len(), 4097);
     let source = materialize_cwd(fixture_source("runtime_config_v1_empty.toml")).replace(
         &session_cwd_assignment(),
-        &format!("session_cwd = {}", toml::Value::String(oversized)),
+        &format!("session_cwd = {}", toml::Value::String(oversized.clone())),
     );
     let source = with_independent_revision(&source);
     let (_directory, path) = write_config_source(&source);
-    assert_loader_error(&source, "4096");
-    assert!(load_runtime_config_v1(&path).is_err());
+    let error = load_runtime_config_v1(&path).expect_err("4097 字节 session_cwd 必须拒绝");
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("4096"));
+    assert!(!rendered.contains(&oversized));
 }
 
 #[test]
@@ -1312,9 +1338,16 @@ fn runtime_config_v2_keeps_shared_path_and_model_contract() {
     assert!(format!("{error:#}").contains("session_cwd"));
 
     let mut escaped_cwd = base.clone();
-    escaped_cwd.session_cwd = "/safe/../session".to_owned();
+    escaped_cwd.session_cwd = session_cwd()
+        .join("..")
+        .join("session")
+        .to_str()
+        .expect("测试路径必须为 UTF-8")
+        .to_owned();
     let error = render_runtime_config_v2(&escaped_cwd).expect_err("带 .. 的路径必须拒绝渲染");
-    assert!(format!("{error:#}").contains("session_cwd"));
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("session_cwd") && rendered.contains(".."));
+    assert!(!rendered.contains(&escaped_cwd.session_cwd));
 
     let mut upstream_url = base.clone();
     upstream_url.model.base_url = "http://localhost:4312/v1".to_owned();
